@@ -9,7 +9,7 @@
 #include <psp2/sysmodule.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
-#include <psp2/net/http.h>
+#include <curl/curl.h>
 #include <psp2/ctrl.h>
 #include <psp2/audioout.h>
 #include <psp2/avplayer.h>
@@ -26,9 +26,8 @@
   "?advertisingId=&appName=web&appVersion=8.0.0&deviceDNT=0&deviceId=%s&deviceMake=chrome" \
   "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s"
 
-// Funciones de SceSsl (declaradas a mano; viven en SceSsl_stub)
-int sceSslInit(unsigned poolSize);
-int sceSslTerm(void);
+// Memoria para el heap de newlib (curl + mbedTLS necesitan bastante)
+int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define MAX_CH 800
 typedef struct { char id[40]; char name[64]; } Channel;
@@ -52,47 +51,47 @@ static void status(const char *msg) {
   vita2d_end_drawing(); vita2d_swap_buffers();
 }
 
-// ---------- HTTP ----------
+// ---------- HTTP (libcurl + mbedTLS) ----------
 static int g_step = 0, g_err = 0, g_status = 0;
+struct mem { char *b; size_t n, cap; };
+
+static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
+  struct mem *m = u; size_t t = sz * nm;
+  if (m->n + t + 1 > m->cap) {
+    size_t nc = m->cap ? m->cap : 256 * 1024;
+    while (nc < m->n + t + 1) nc *= 2;
+    if (nc > 16 * 1024 * 1024) return 0;
+    char *nb = realloc(m->b, nc);
+    if (!nb) return 0;
+    m->b = nb; m->cap = nc;
+  }
+  memcpy(m->b + m->n, p, t); m->n += t; m->b[m->n] = 0;
+  return t;
+}
 
 static char *http_get(const char *url, int *outlen) {
   g_step = 1; g_err = 0; g_status = 0;
-  int tpl = sceHttpCreateTemplate("Mozilla/5.0 PlutoVita", SCE_HTTP_VERSION_1_1, 1);
-  if (tpl < 0) { g_err = tpl; return NULL; }
-  sceHttpsDisableOption(0x3F); /* desactiva todas las verificaciones de certificado */ // sin CA certs en Vita
-  g_step = 2;
-  int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
-  if (conn < 0) g_err = conn;
-  g_step = 3;
-  int req  = conn >= 0 ? sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0) : -1;
-  if (req < 0 && conn >= 0) g_err = req;
-  char *buf = NULL; int len = 0;
-  if (req >= 0) {
-    g_step = 4;
-    int sr = sceHttpSendRequest(req, NULL, 0);
-    if (sr < 0) g_err = sr;
-    else {
-      g_step = 5;
-      sceHttpGetStatusCode(req, &g_status);
-      int cap = 256 * 1024; buf = malloc(cap);
-      int n;
-      while (buf && (n = sceHttpReadData(req, buf + len, cap - len - 1)) > 0) {
-        len += n;
-        if (cap - len < 16 * 1024) {
-          if (cap >= 8 * 1024 * 1024) break;
-          cap *= 2; char *nb = realloc(buf, cap);
-          if (!nb) { free(buf); buf = NULL; len = 0; break; }
-          buf = nb;
-        }
-      }
-      if (buf) buf[len] = 0;
-    }
-  }
-  if (req >= 0) sceHttpDeleteRequest(req);
-  if (conn >= 0) sceHttpDeleteConnection(conn);
-  sceHttpDeleteTemplate(tpl);
-  if (outlen) *outlen = len;
-  return buf;
+  CURL *c = curl_easy_init();
+  if (!c) { g_err = -1; return NULL; }
+  struct mem m = {0, 0, 0};
+  curl_easy_setopt(c, CURLOPT_URL, url);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wcb);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, "Mozilla/5.0 PlutoVita");
+  curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+  g_step = 4;
+  CURLcode rc = curl_easy_perform(c);
+  g_err = (int)rc;
+  long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st); g_status = (int)st;
+  curl_easy_cleanup(c);
+  if (rc != CURLE_OK || st >= 400) { free(m.b); return NULL; }
+  if (outlen) *outlen = (int)m.n;
+  return m.b;
 }
 
 static int copy_str(const char *p, char *dst, int max) { // copia hasta la comilla
@@ -200,11 +199,10 @@ static void play_channel(const Channel *c) {
 // ---------- Main ----------
 int main(void) {
   sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-  sceSysmoduleLoadModule(SCE_SYSMODULE_HTTPS);
   static char netmem[1024 * 1024];
   SceNetInitParam np = { netmem, sizeof netmem, 0 };
   sceNetInit(&np); sceNetCtlInit();
-  sceSslInit(300 * 1024); sceHttpInit(1024 * 1024);
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 
   vita2d_init(); pgf = vita2d_load_default_pgf();
   sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
@@ -246,7 +244,7 @@ int main(void) {
   }
 out:
   vita2d_fini();
-  sceHttpTerm(); sceSslTerm(); sceNetCtlTerm(); sceNetTerm();
+  curl_global_cleanup(); sceNetCtlTerm(); sceNetTerm();
   sceKernelExitProcess(0);
   return 0;
 }
