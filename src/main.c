@@ -49,26 +49,40 @@ static void status(const char *msg) {
 }
 
 // ---------- HTTP ----------
+static int g_step = 0, g_err = 0, g_status = 0;
+
 static char *http_get(const char *url, int *outlen) {
+  g_step = 1; g_err = 0; g_status = 0;
   int tpl = sceHttpCreateTemplate("Mozilla/5.0 PlutoVita", SCE_HTTP_VERSION_1_1, 1);
-  if (tpl < 0) return NULL;
+  if (tpl < 0) { g_err = tpl; return NULL; }
   sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY); // sin CA certs en Vita
+  g_step = 2;
   int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
+  if (conn < 0) g_err = conn;
+  g_step = 3;
   int req  = conn >= 0 ? sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0) : -1;
+  if (req < 0 && conn >= 0) g_err = req;
   char *buf = NULL; int len = 0;
-  if (req >= 0 && sceHttpSendRequest(req, NULL, 0) >= 0) {
-    int cap = 256 * 1024; buf = malloc(cap);
-    int n;
-    while (buf && (n = sceHttpReadData(req, buf + len, cap - len - 1)) > 0) {
-      len += n;
-      if (cap - len < 16 * 1024) {
-        if (cap >= 8 * 1024 * 1024) break;
-        cap *= 2; char *nb = realloc(buf, cap);
-        if (!nb) { free(buf); buf = NULL; len = 0; break; }
-        buf = nb;
+  if (req >= 0) {
+    g_step = 4;
+    int sr = sceHttpSendRequest(req, NULL, 0);
+    if (sr < 0) g_err = sr;
+    else {
+      g_step = 5;
+      sceHttpGetStatusCode(req, &g_status);
+      int cap = 256 * 1024; buf = malloc(cap);
+      int n;
+      while (buf && (n = sceHttpReadData(req, buf + len, cap - len - 1)) > 0) {
+        len += n;
+        if (cap - len < 16 * 1024) {
+          if (cap >= 8 * 1024 * 1024) break;
+          cap *= 2; char *nb = realloc(buf, cap);
+          if (!nb) { free(buf); buf = NULL; len = 0; break; }
+          buf = nb;
+        }
       }
+      if (buf) buf[len] = 0;
     }
-    if (buf) buf[len] = 0;
   }
   if (req >= 0) sceHttpDeleteRequest(req);
   if (conn >= 0) sceHttpDeleteConnection(conn);
@@ -193,9 +207,13 @@ int main(void) {
   make_uuid(uuid); make_uuid(sid);
 
   status("Conectando con Pluto TV...");
-  if (get_session() < 0) { status("Error de sesion. Revisa el WiFi. (reinicia la app)"); sceKernelDelayThread(5000000); goto out; }
+  if (get_session() < 0) {
+    char m[200]; snprintf(m, sizeof m, "Error sesion: paso %d  codigo 0x%08X  http %d", g_step, (unsigned)g_err, g_status);
+    status(m); sceKernelDelayThread(15000000); goto out; }
   status("Descargando canales...");
-  if (get_channels() < 0) { status("Error cargando canales."); sceKernelDelayThread(5000000); goto out; }
+  if (get_channels() < 0) {
+    char m[200]; snprintf(m, sizeof m, "Error canales: paso %d  codigo 0x%08X  http %d", g_step, (unsigned)g_err, g_status);
+    status(m); sceKernelDelayThread(15000000); goto out; }
 
   int sel = 0, top = 0; const int rows = 15;
   for (;;) {
