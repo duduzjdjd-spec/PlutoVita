@@ -6,6 +6,8 @@ jobs:
     container: vitasdk/vitasdk:latest
     steps:
       - uses: actions/checkout@v4
+      - name: Asegurar curl y mbedtls
+        run: vdpm curl mbedtls zlib || true
       - run: mkdir build && cd build && cmake .. && make
       - uses: actions/upload-artifact@v4
         with:
