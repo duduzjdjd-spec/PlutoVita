@@ -40,10 +40,14 @@
 #define STITCH_URL \
   "https://service-stitcher.clusters.pluto.tv/v2/stitch/hls/channel/%s/master.m3u8" \
   "?advertisingId=&appName=web&appVersion=8.0.0&deviceDNT=0&deviceId=%s&deviceMake=chrome" \
-  "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s"
+  "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s" \
+  "&masterJWTPassthrough=true"
+// URL preferida (la que usa la web de Pluto): servidor y parametros que da el arranque
+#define STITCH_URL2 "%s/v2/stitch/hls/channel/%s/master.m3u8?%s&jwt=%s&masterJWTPassthrough=true"
 
 // ---- Ajustes del reproductor ----
 #define MAX_HEIGHT  576          // calidad maxima a elegir (la pantalla es 544 de alto)
+#define MAX_BW_NORES 2500000     // si la lista no dice la resolucion: tope de bits por segundo
 #define SEG_AHEAD   3            // segmentos .ts bajados por adelantado
 #define VQ_MAX      300          // unidades de video comprimidas en cola (~10 s)
 #define PCM_SLOTS   192          // bloques de audio decodificado en cola (~4 s)
@@ -61,6 +65,7 @@ typedef struct { char id[40]; char name[64]; } Channel;
 static Channel chans[MAX_CH];
 static int nchans = 0;
 static char uuid[40], sid[40], jwt[2048];
+static char stitcher[256], sparams[2048];   // del arranque de Pluto
 
 static vita2d_pgf *pgf;
 static SceCtrlData pad, oldpad;
@@ -136,12 +141,32 @@ static int copy_str(const char *p, char *dst, int max) { // copia hasta la comil
   dst[i] = 0; return i;
 }
 
+// Copia un texto JSON hasta la comilla final, resolviendo \u0026, \/ y \"
+static void copy_json(const char *p, char *dst, int max) {
+  int i = 0;
+  while (*p && *p != '"' && i < max - 1) {
+    if (*p == '\\' && p[1]) {
+      if (p[1] == 'u' && p[2] && p[3] && p[4] && p[5]) {
+        char hx[5] = { p[2], p[3], p[4], p[5], 0 };
+        dst[i++] = (char)strtol(hx, NULL, 16); p += 6; continue;
+      }
+      dst[i++] = p[1]; p += 2; continue;
+    }
+    dst[i++] = *p++;
+  }
+  dst[i] = 0;
+}
+
 static int get_session(void) {
   char url[1024]; snprintf(url, sizeof url, BOOT_URL, uuid);
   char *r = http_get(url, NULL); if (!r) return -1;
   char *t = strstr(r, "\"sessionToken\":\"");
   int ok = -1;
   if (t) { copy_str(t + 16, jwt, sizeof jwt); ok = jwt[0] ? 0 : -1; }
+  char *sp = strstr(r, "\"stitcherParams\":\"");
+  if (sp) copy_json(sp + 18, sparams, sizeof sparams);
+  char *sv = strstr(r, "\"stitcher\":\"");
+  if (sv) copy_json(sv + 12, stitcher, sizeof stitcher);
   free(r); return ok;
 }
 
@@ -180,6 +205,7 @@ static void nap_ms(int ms) {
 // ---- Datos de depuracion (se muestran en pantalla) ----
 static struct {
   char variant[80];
+  int url2, jwt_added;
   int segs, seg_err, pl_err, pl_loads, http, curl, keyenc;
   int aus, frames, shown, dropped, dec_err, vopen, vw, vh, refs;
   unsigned last_dec_err, vinit_err;
@@ -238,7 +264,8 @@ static int pick_variant(const char *m, const char *base, char *out, int cap) {
     } else if (pending && line[0] && line[0] != '#') {
       pending = 0;
       if (skip) continue;
-      if (h <= MAX_HEIGHT && bw > best_bw) { best_bw = bw; best_h = h; snprintf(best, sizeof best, "%s", line); }
+      int fits = h > 0 ? h <= MAX_HEIGHT : bw <= MAX_BW_NORES;
+      if (fits && bw > best_bw) { best_bw = bw; best_h = h; snprintf(best, sizeof best, "%s", line); }
       if (bw < low_bw) { low_bw = bw; low_h = h; snprintf(low, sizeof low, "%s", line); }
     }
   }
@@ -900,7 +927,7 @@ static void pick_frame(void) {
 
 static void draw_debug(int y0) {
   char l[200]; uint32_t col = RGBA8(255,255,0,255);
-  snprintf(l, sizeof l, "Calidad: %s", st.variant);
+  snprintf(l, sizeof l, "Calidad: %s   URL %s%s", st.variant, st.url2 ? "nueva" : "vieja", st.jwt_added ? "  +jwt" : "");
   vita2d_pgf_draw_text(pgf, 20, y0, col, 0.9f, l);
   snprintf(l, sizeof l, "Red: segmentos %d  errores %d  lista %d/%d  http %d  curl %d  cola %d%s",
            st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, sq_count, st.keyenc ? "  CIFRADO" : "");
@@ -919,8 +946,10 @@ static void draw_debug(int y0) {
 
 static void play_channel(const Channel *c) {
   static char url[4096];
-  snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
   memset(&st, 0, sizeof st);
+  int use2 = stitcher[0] && sparams[0];
+  if (use2) snprintf(url, sizeof url, STITCH_URL2, stitcher, c->id, sparams, jwt);
+  else snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
   status("Cargando canal...");
   char *master = http_get(url, NULL);
   if (!master) {
@@ -929,6 +958,12 @@ static void play_channel(const Channel *c) {
   }
   int pv = pick_variant(master, url, g_media_url, sizeof g_media_url);
   free(master);
+  if (pv == 0 && !strstr(g_media_url, "jwt=")) {   // la lista de calidad tambien pide el token
+    int n = strlen(g_media_url);
+    snprintf(g_media_url + n, sizeof g_media_url - n, "%cjwt=%s", strchr(g_media_url, '?') ? '&' : '?', jwt);
+    st.jwt_added = 1;
+  }
+  st.url2 = use2;
   if (pv < 0) { status("La lista del canal no tiene video H.264"); sceKernelDelayThread(4000000); return; }
 
   // estado inicial
