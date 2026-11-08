@@ -26,6 +26,10 @@
   "?advertisingId=&appName=web&appVersion=8.0.0&deviceDNT=0&deviceId=%s&deviceMake=chrome" \
   "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s"
 
+// Funciones de SceSsl (declaradas a mano; viven en SceSsl_stub)
+int sceSslInit(unsigned poolSize);
+int sceSslTerm(void);
+
 #define MAX_CH 800
 typedef struct { char id[40]; char name[64]; } Channel;
 static Channel chans[MAX_CH];
@@ -200,7 +204,7 @@ int main(void) {
   static char netmem[1024 * 1024];
   SceNetInitParam np = { netmem, sizeof netmem, 0 };
   sceNetInit(&np); sceNetCtlInit();
-  sceHttpInit(1024 * 1024);
+  sceSslInit(300 * 1024); sceHttpInit(1024 * 1024);
 
   vita2d_init(); pgf = vita2d_load_default_pgf();
   sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
@@ -242,7 +246,7 @@ int main(void) {
   }
 out:
   vita2d_fini();
-  sceHttpTerm(); sceNetCtlTerm(); sceNetTerm();
+  sceHttpTerm(); sceSslTerm(); sceNetCtlTerm(); sceNetTerm();
   sceKernelExitProcess(0);
   return 0;
 }
