@@ -19,10 +19,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -std=gnu99")
 add_executable(${PROJECT_NAME} src/main.c)
 
 target_link_libraries(${PROJECT_NAME}
-  vita2d freetype png jpeg z m c
+  vita2d curl mbedtls mbedx509 mbedcrypto freetype png jpeg z m c
   SceDisplay_stub SceGxm_stub SceCtrl_stub SceSysmodule_stub
   ScePgf_stub ScePvf_stub SceCommonDialog_stub
-  SceNet_stub SceNetCtl_stub SceHttp_stub SceSsl_stub
+  SceNet_stub SceNetCtl_stub
   SceAvPlayer_stub SceAudio_stub SceAppUtil_stub
   SceAppMgr_stub SceLibKernel_stub
 )
