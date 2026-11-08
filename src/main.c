@@ -29,6 +29,7 @@
 #include <psp2/videodec.h>
 #include <psp2/gxm.h>
 #include <curl/curl.h>
+#include <openssl/evp.h>
 #include <vita2d.h>
 
 // ---- Endpoints (si Pluto los cambia, editalos aqui) ----
@@ -206,7 +207,9 @@ static void nap_ms(int ms) {
 static struct {
   char variant[80];
   int url2, jwt_added;
-  int segs, seg_err, pl_err, pl_loads, http, curl, keyenc;
+  int segs, seg_err, pl_err, pl_loads, http, curl;
+  int enc_aes, enc_other, keys, key_err, dec_fail;
+  char keymethod[24];
   int aus, frames, shown, dropped, dec_err, vopen, vw, vh, refs;
   unsigned last_dec_err, vinit_err;
   int arate, ach, aframes, aerr, alate;
@@ -297,14 +300,53 @@ static Seg *seg_pop(void) {
   return s;
 }
 
+// ---- Cifrado AES-128 de HLS (#EXT-X-KEY:METHOD=AES-128) ----
+// Cada segmento va cifrado con AES-128-CBC. La llave (16 bytes) se baja de la URI de la etiqueta;
+// el IV viene en la etiqueta o, si no, es el numero de secuencia del segmento.
+static char key_uri[4096];
+static uint8_t key_val[16];
+static int key_ok;
+
+static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+
+static int get_key(const char *uri) {
+  if (key_ok && !strcmp(uri, key_uri)) return 0;
+  int n = 0;
+  char *k = http_get(uri, &n);
+  st.http = g_status; st.curl = g_err;
+  if (!k || n != 16) { free(k); st.key_err++; key_ok = 0; return -1; }
+  memcpy(key_val, k, 16); free(k);
+  snprintf(key_uri, sizeof key_uri, "%s", uri);
+  key_ok = 1; st.keys++;
+  return 0;
+}
+
+// Descifra en un bufer nuevo; devuelve el largo o -1
+static int aes_decrypt(const uint8_t *in, int len, const uint8_t *iv, uint8_t **out) {
+  *out = NULL;
+  if (len <= 0 || len % 16) return -1;
+  uint8_t *o = malloc(len + 16);
+  if (!o) return -1;
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  if (!c) { free(o); return -1; }
+  int n1 = 0, n2 = 0, ok = EVP_DecryptInit_ex(c, EVP_aes_128_cbc(), NULL, key_val, iv) == 1 &&
+                           EVP_DecryptUpdate(c, o, &n1, in, len) == 1;
+  if (ok && EVP_DecryptFinal_ex(c, o + n1, &n2) != 1) n2 = 0;   // relleno raro: se queda con lo descifrado
+  EVP_CIPHER_CTX_free(c);
+  if (!ok) { free(o); return -1; }
+  *out = o;
+  return n1 + n2;
+}
+
 // ---- Hilo de red: recarga la lista y baja segmentos ----
 static char g_media_url[4096];
 
 #define MAX_SEGS 256
+typedef struct { char *uri; char *key; int disc, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
+
 static int net_thread(SceSize a, void *u) {
-  static char line[4096];
-  static char *uris[MAX_SEGS];
-  static int discs[MAX_SEGS];
+  static char line[4096], cur_key[4096];
+  static SegInfo segs[MAX_SEGS];
   int64_t next_seq = -1;
   int pending_disc = 0;
   while (playing) {
@@ -314,17 +356,47 @@ static int net_thread(SceSize a, void *u) {
     if (!pl) { st.pl_err++; nap_ms(2000); continue; }
     st.pl_loads++;
     int64_t mseq = 0; int tdur = 6, n = 0, ended = 0, disc = 0;
+    int method = 0, has_iv = 0; uint8_t iv[16]; cur_key[0] = 0;
     const char *p = pl;
     while ((p = next_line(p, line, sizeof line)) != NULL) {
       if (!strncmp(line, "#EXT-X-MEDIA-SEQUENCE:", 22)) mseq = atoll(line + 22);
       else if (!strncmp(line, "#EXT-X-TARGETDURATION:", 22)) tdur = atoi(line + 22);
       else if (!strncmp(line, "#EXT-X-DISCONTINUITY", 20) && line[20] != '-') disc = 1;
       else if (!strncmp(line, "#EXT-X-ENDLIST", 14)) ended = 1;
-      else if (!strncmp(line, "#EXT-X-KEY:", 11) && !strstr(line, "METHOD=NONE")) st.keyenc = 1;
+      else if (!strncmp(line, "#EXT-X-KEY:", 11)) {
+        method = strstr(line, "METHOD=NONE") ? 0 : strstr(line, "METHOD=AES-128") ? 1 : 2;
+        if (method == 2) { const char *m = strstr(line, "METHOD="); snprintf(st.keymethod, sizeof st.keymethod, "%.20s", m ? m + 7 : "?"); }
+        cur_key[0] = 0; has_iv = 0;
+        const char *ur = strstr(line, "URI=\"");
+        if (ur) {
+          char raw[4096]; int i = 0; ur += 5;
+          while (*ur && *ur != '"' && i < (int)sizeof raw - 1) raw[i++] = *ur++;
+          raw[i] = 0;
+          url_resolve(g_media_url, raw, cur_key, sizeof cur_key);
+        }
+        const char *ivp = strstr(line, "IV=0x"); if (!ivp) ivp = strstr(line, "IV=0X");
+        if (ivp) {
+          ivp += 5; memset(iv, 0, 16);
+          int nd = 0; while (hexval(ivp[nd]) >= 0) nd++;
+          for (int k = 0; k < nd && k < 32; k++) {        // alineado a la derecha
+            int pos = 31 - (nd - 1 - k); if (pos < 0) continue;
+            int v = hexval(ivp[k]);
+            if (pos & 1) iv[pos / 2] |= v; else iv[pos / 2] |= v << 4;
+          }
+          has_iv = 1;
+        }
+      }
       else if (line[0] && line[0] != '#') {
         if (n < MAX_SEGS) {
-          char *u2 = malloc(4096);
-          if (u2) { url_resolve(g_media_url, line, u2, 4096); uris[n] = u2; discs[n] = disc; n++; }
+          SegInfo *si = &segs[n];
+          si->uri = malloc(4096);
+          if (si->uri) {
+            url_resolve(g_media_url, line, si->uri, 4096);
+            si->disc = disc; si->method = method; si->has_iv = has_iv;
+            memcpy(si->iv, iv, 16);
+            si->key = method == 1 && cur_key[0] ? strdup(cur_key) : NULL;
+            n++;
+          }
         }
         disc = 0;
       }
@@ -339,15 +411,27 @@ static int net_thread(SceSize a, void *u) {
       if (seq < next_seq) continue;
       while (playing && sq_count >= SEG_AHEAD) nap_ms(20);
       if (!playing) break;
-      int sl = 0;
-      char *d = http_get(uris[i], &sl);
-      st.http = g_status; st.curl = g_err;
+      SegInfo *si = &segs[i];
       next_seq = seq + 1;
+      if (si->method == 2) { st.enc_other++; pending_disc = 1; continue; }   // cifrado que no se puede abrir (DRM)
+      int sl = 0;
+      char *d = http_get(si->uri, &sl);
+      st.http = g_status; st.curl = g_err;
       if (!d) { st.seg_err++; pending_disc = 1; continue; }
-      seg_push((uint8_t *)d, sl, discs[i] || pending_disc);
+      if (si->method == 1) {
+        st.enc_aes++;
+        uint8_t ivb[16], *plain = NULL;
+        if (si->has_iv) memcpy(ivb, si->iv, 16);
+        else { memset(ivb, 0, 16); for (int k = 0; k < 8; k++) ivb[15 - k] = (uint8_t)((uint64_t)seq >> (8 * k)); }
+        int pn = (si->key && get_key(si->key) == 0) ? aes_decrypt((uint8_t *)d, sl, ivb, &plain) : -1;
+        free(d);
+        if (pn < 0) { st.dec_fail++; pending_disc = 1; continue; }
+        d = (char *)plain; sl = pn;
+      }
+      seg_push((uint8_t *)d, sl, si->disc || pending_disc);
       pending_disc = 0; got = 1; st.segs++;
     }
-    for (int i = 0; i < n; i++) free(uris[i]);
+    for (int i = 0; i < n; i++) { free(segs[i].uri); free(segs[i].key); segs[i].uri = segs[i].key = NULL; }
     if (ended && !got) { snprintf(st.msg, sizeof st.msg, "Fin de la transmision"); break; }
     if (!got) nap_ms(tdur * 500);
   }
@@ -929,9 +1013,14 @@ static void draw_debug(int y0) {
   char l[200]; uint32_t col = RGBA8(255,255,0,255);
   snprintf(l, sizeof l, "Calidad: %s   URL %s%s", st.variant, st.url2 ? "nueva" : "vieja", st.jwt_added ? "  +jwt" : "");
   vita2d_pgf_draw_text(pgf, 20, y0, col, 0.9f, l);
-  snprintf(l, sizeof l, "Red: segmentos %d  errores %d  lista %d/%d  http %d  curl %d  cola %d%s",
-           st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, sq_count, st.keyenc ? "  CIFRADO" : "");
+  snprintf(l, sizeof l, "Red: segmentos %d  errores %d  lista %d/%d  http %d  curl %d  cola %d",
+           st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, sq_count);
   vita2d_pgf_draw_text(pgf, 20, y0 + 26, col, 0.9f, l);
+  if (st.enc_aes || st.enc_other) {
+    snprintf(l, sizeof l, "Cifrado: AES-128 %d  llaves %d  err llave %d  err descifrar %d  otro %d %s",
+             st.enc_aes, st.keys, st.key_err, st.dec_fail, st.enc_other, st.keymethod);
+    vita2d_pgf_draw_text(pgf, 20, y0 + 156, RGBA8(120,220,255,255), 0.9f, l);
+  }
   snprintf(l, sizeof l, "Video: %dx%d refs %d  AUs %d  cuadros %d  mostrados %d  saltados %d",
            st.vw, st.vh, st.refs, st.aus, st.frames, st.shown, st.dropped);
   vita2d_pgf_draw_text(pgf, 20, y0 + 52, col, 0.9f, l);
@@ -947,6 +1036,7 @@ static void draw_debug(int y0) {
 static void play_channel(const Channel *c) {
   static char url[4096];
   memset(&st, 0, sizeof st);
+  key_ok = 0; key_uri[0] = 0;
   int use2 = stitcher[0] && sparams[0];
   if (use2) snprintf(url, sizeof url, STITCH_URL2, stitcher, c->id, sparams, jwt);
   else snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
