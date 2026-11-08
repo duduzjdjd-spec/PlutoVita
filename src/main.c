@@ -231,7 +231,8 @@ static struct {
   char variant[80];
   int url2, jwt_added, alt_audio;
   char ts_types[48], ats_types[48], alang[16];
-  int asegs, aseg_err, apl_loads, apl_err, packed;
+  int asegs, aseg_err, apl_loads, apl_err, packed, amode, ahttp;
+  char auri[80];
   int segs, seg_err, pl_err, pl_loads, http, curl;
   int enc_aes, enc_other, keys, key_err, dec_fail;
   char keymethod[24];
@@ -343,6 +344,7 @@ static int pick_variant(const char *m, const char *base, char *out, int cap, cha
   }
   if (bi >= 0) {
     url_resolve(base, media[bi].uri, aout, acap);
+    snprintf(st.auri, sizeof st.auri, "%.70s", media[bi].uri);
     snprintf(st.alang, sizeof st.alang, "%s", media[bi].lang[0] ? media[bi].lang : "?");
   }
   return 0;
@@ -396,7 +398,8 @@ static int aes_decrypt(const uint8_t *key, const uint8_t *in, int len, const uin
 #define MAX_SEGS 256
 typedef struct { char *uri; char *key; int epoch, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
 typedef struct {
-  char url[4096];
+  char url[4096], orig[4096];
+  int mode;                      // audio: 0 URL original, 1 ruta + parametros del video, 2 original + parametros del video
   SegQ *q;
   int is_audio;
   char key_uri[4096]; uint8_t key_val[16]; int key_ok;
@@ -404,6 +407,16 @@ typedef struct {
   SegInfo segs[MAX_SEGS];
 } NetCtx;
 static NetCtx *vnet, *anet;
+
+// La lista de audio aparte rechazada (401): prueba con los parametros de la lista de video, que si funciona
+static void audio_alt_url(NetCtx *c) {
+  const char *vq = vnet ? strchr(vnet->url, '?') : NULL;
+  if (c->mode == 0 || !vq) { snprintf(c->url, sizeof c->url, "%s", c->orig); return; }
+  char path[4096]; snprintf(path, sizeof path, "%s", c->orig);
+  char *q = strchr(path, '?');
+  if (c->mode == 1) { if (q) *q = 0; snprintf(c->url, sizeof c->url, "%s%s", path, vq); }
+  else snprintf(c->url, sizeof c->url, "%s%c%s", c->orig, q ? '&' : '?', vq + 1);
+}
 
 static int get_key(NetCtx *c, const char *uri) {
   if (c->key_ok && !strcmp(uri, c->key_uri)) return 0;
@@ -425,7 +438,14 @@ static int net_thread(SceSize a, void *argp) {
     int len = 0;
     char *pl = http_get(c->url, &len);
     st.http = g_status; st.curl = g_err;
-    if (!pl) { if (c->is_audio) st.apl_err++; else st.pl_err++; nap_ms(2000); continue; }
+    if (c->is_audio) st.ahttp = g_status;
+    if (!pl) {
+      if (c->is_audio) {
+        st.apl_err++;
+        if (g_status == 401 || g_status == 403) { c->mode = (c->mode + 1) % 3; audio_alt_url(c); st.amode = c->mode; nap_ms(300); continue; }
+      } else st.pl_err++;
+      nap_ms(2000); continue;
+    }
     if (c->is_audio) st.apl_loads++; else st.pl_loads++;
     int64_t mseq = 0, dseq = 0; int tdur = 6, n = 0, ended = 0, dcount = 0;
     int method = 0, has_iv = 0; uint8_t iv[16]; c->cur_key[0] = 0;
@@ -1152,9 +1172,11 @@ static void draw_debug(int y0) {
            st.arate, st.ach, st.aframes, st.alate, st.aerr, st.last_aerr, pcm_count, st.ts_types);
   vita2d_pgf_draw_text(pgf, 20, y0 + 104, col, 0.9f, l);
   if (anet) {
-    snprintf(l, sizeof l, "Audio aparte (%s): segmentos %d  errores %d  lista %d/%d  aac %d  TS: %s",
-             st.alang, st.asegs, st.aseg_err, st.apl_loads, st.apl_err, st.packed, st.ats_types);
+    snprintf(l, sizeof l, "Audio aparte (%s): segmentos %d  errores %d  lista %d/%d  http %d  modo %d  aac %d  TS: %s",
+             st.alang, st.asegs, st.aseg_err, st.apl_loads, st.apl_err, st.ahttp, st.amode, st.packed, st.ats_types);
     vita2d_pgf_draw_text(pgf, 20, y0 + 182, RGBA8(120,255,160,255), 0.9f, l);
+    snprintf(l, sizeof l, "URI audio: %s", st.auri);
+    vita2d_pgf_draw_text(pgf, 20, y0 + 208, RGBA8(120,255,160,255), 0.8f, l);
   }
   if (st.msg[0]) vita2d_pgf_draw_text(pgf, 20, y0 + 130, RGBA8(255,120,120,255), 0.9f, st.msg);
 }
@@ -1191,6 +1213,7 @@ static void play_channel(const Channel *c) {
     st.jwt_added = 1;
   }
   if (!anet->url[0]) { free(anet); anet = NULL; }
+  else snprintf(anet->orig, sizeof anet->orig, "%s", anet->url);
   vnet->q = &vsq; vnet->is_audio = 0;
   if (anet) { anet->q = &asq; anet->is_audio = 1; }
 
@@ -1245,8 +1268,8 @@ static void play_channel(const Channel *c) {
       vita2d_pgf_draw_text(pgf, 20, 60, RGBA8(255,255,255,255), 1.2f, "Buffering...  (O = volver)");
     }
     if (show_dbg || sh < 0) {
-      if (sh >= 0) vita2d_draw_rectangle(0, 310, 960, 234, RGBA8(0,0,0,170));
-      draw_debug(sh >= 0 ? 336 : 110);
+      if (sh >= 0) vita2d_draw_rectangle(0, 286, 960, 258, RGBA8(0,0,0,170));
+      draw_debug(sh >= 0 ? 310 : 110);
     }
     vita2d_end_drawing();
     vita2d_wait_rendering_done();       // la GPU termino: ya se pueden reciclar los cuadros
