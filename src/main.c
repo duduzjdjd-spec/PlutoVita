@@ -40,13 +40,20 @@
   "&deviceModel=web&deviceMake=chrome&deviceType=web&clientID=%s&clientModelNumber=1.0.0" \
   "&serverSideAds=false&drmCapabilities=&blockingMode=&notificationVersion=1"
 #define CHANNELS_URL "https://api.pluto.tv/v2/channels.json"
+// %s = "channel" (en vivo) o "episode" (peliculas y episodios a la carta)
 #define STITCH_URL \
-  "https://service-stitcher.clusters.pluto.tv/v2/stitch/hls/channel/%s/master.m3u8" \
+  "https://service-stitcher.clusters.pluto.tv/v2/stitch/hls/%s/%s/master.m3u8" \
   "?advertisingId=&appName=web&appVersion=8.0.0&deviceDNT=0&deviceId=%s&deviceMake=chrome" \
   "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s" \
   "&masterJWTPassthrough=true"
 // URL preferida (la que usa la web de Pluto): servidor y parametros que da el arranque
-#define STITCH_URL2 "%s/v2/stitch/hls/channel/%s/master.m3u8?%s&jwt=%s&masterJWTPassthrough=true"
+#define STITCH_URL2 "%s/v2/stitch/hls/%s/%s/master.m3u8?%s&jwt=%s&masterJWTPassthrough=true"
+// Catalogo a la carta (peliculas y series). v4 pide el token en "Authorization: Bearer"; v3 es el respaldo.
+#define VOD_CATS_V4    "https://service-vod.clusters.pluto.tv/v4/vod/categories?includeItems=false&offset=1000&page=1"
+#define VOD_ITEMS_V4   "https://service-vod.clusters.pluto.tv/v4/vod/categories/%s/items?offset=1000&page=1"
+#define VOD_SEASONS_V4 "https://service-vod.clusters.pluto.tv/v4/vod/series/%s/seasons?offset=1000&page=1"
+#define VOD_CATS_V3    "https://api.pluto.tv/v3/vod/categories?includeItems=true&deviceType=web"
+#define VOD_SEASONS_V3 "https://api.pluto.tv/v3/vod/series/%s/seasons?deviceType=web"
 
 // ---- Ajustes del reproductor ----
 #define MAX_HEIGHT  576          // calidad maxima a elegir (la pantalla es 544 de alto)
@@ -67,7 +74,7 @@ int _newlib_heap_size_user = 64 * 1024 * 1024;
 typedef struct { char id[40]; char name[64]; } Channel;
 static Channel chans[MAX_CH];
 static int nchans = 0;
-static char uuid[40], sid[40], jwt[2048];
+static char uuid[40], sid[40];
 static char stitcher[256], sparams[2048];   // del arranque de Pluto
 
 static vita2d_pgf *pgf;
@@ -111,10 +118,18 @@ static int xferinfo(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_
   return g_abort ? 1 : 0;
 }
 
-static char *http_get(const char *url, int *outlen) {
+static char jwt[2048];
+static char *http_req(const char *url, int *outlen, int bearer) {
   g_step = 1; g_err = 0; g_status = 0;
   CURL *c = curl_easy_init();
   if (!c) { g_err = -1; return NULL; }
+  struct curl_slist *hdr = NULL;
+  if (bearer && jwt[0]) {
+    static char auth[2200];
+    snprintf(auth, sizeof auth, "Authorization: Bearer %s", jwt);
+    hdr = curl_slist_append(hdr, auth);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
+  }
   struct mem m = {0, 0, 0};
   curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wcb);
@@ -134,10 +149,12 @@ static char *http_get(const char *url, int *outlen) {
   g_err = (int)rc;
   long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st); g_status = (int)st;
   curl_easy_cleanup(c);
+  if (hdr) curl_slist_free_all(hdr);
   if (rc != CURLE_OK || st >= 400) { free(m.b); return NULL; }
   if (outlen) *outlen = (int)m.n;
   return m.b;
 }
+static char *http_get(const char *url, int *outlen) { return http_req(url, outlen, 0); }
 
 static int copy_str(const char *p, char *dst, int max) { // copia hasta la comilla
   int i = 0; while (*p && *p != '"' && i < max - 1) dst[i++] = *p++;
@@ -395,7 +412,7 @@ static int aes_decrypt(const uint8_t *key, const uint8_t *in, int len, const uin
 
 // ---- Hilos de red: recargan su lista y bajan segmentos ----
 // Hay uno para el video y, si el canal trae el audio en otra lista, otro para el audio.
-#define MAX_SEGS 256
+#define MAX_SEGS 4096          // una pelicula de 2 h tiene ~1200 segmentos
 typedef struct { char *uri; char *key; int epoch, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
 typedef struct {
   char url[4096], orig[4096];
@@ -478,9 +495,9 @@ static int net_thread(SceSize a, void *argp) {
       else if (line[0] && line[0] != '#') {
         if (n < MAX_SEGS) {
           SegInfo *si = &c->segs[n];
-          si->uri = malloc(4096);
+          url_resolve(c->url, line, c->raw, sizeof c->raw);
+          si->uri = strdup(c->raw);
           if (si->uri) {
-            url_resolve(c->url, line, si->uri, 4096);
             si->epoch = (int)(dseq + dcount);   // igual en la lista de video y la de audio
             si->method = method; si->has_iv = has_iv;
             memcpy(si->iv, iv, 16);
@@ -492,7 +509,8 @@ static int net_thread(SceSize a, void *argp) {
     }
     free(pl);
     if (tdur < 1) tdur = 1;
-    if (next_seq < 0 || next_seq > mseq + n + 10) next_seq = mseq + (n > 3 ? n - 3 : 0);
+    if (next_seq < 0) next_seq = ended ? mseq : mseq + (n > 3 ? n - 3 : 0);   // a la carta: desde el inicio; en vivo: cerca del final
+    else if (next_seq > mseq + n + 10) next_seq = mseq + (n > 3 ? n - 3 : 0);
     if (next_seq < mseq) { next_seq = mseq; pending_reset = 1; }   // nos quedamos atras
     int got = 0;
     for (int i = 0; i < n && playing; i++) {
@@ -1181,16 +1199,17 @@ static void draw_debug(int y0) {
   if (st.msg[0]) vita2d_pgf_draw_text(pgf, 20, y0 + 130, RGBA8(255,120,120,255), 0.9f, st.msg);
 }
 
-static void play_channel(const Channel *c) {
+static void play_stream(const char *kind, const char *id) {
   static char url[4096];
   memset(&st, 0, sizeof st);
   int use2 = stitcher[0] && sparams[0];
-  if (use2) snprintf(url, sizeof url, STITCH_URL2, stitcher, c->id, sparams, jwt);
-  else snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
-  status("Cargando canal...");
+  if (use2) snprintf(url, sizeof url, STITCH_URL2, stitcher, kind, id, sparams, jwt);
+  else snprintf(url, sizeof url, STITCH_URL, kind, id, uuid, sid, jwt);
+  status("Cargando...");
   char *master = http_get(url, NULL);
   if (!master) {
-    char m[200]; snprintf(m, sizeof m, "No se pudo abrir el canal: curl %d  http %d", g_err, g_status);
+    char m[200]; snprintf(m, sizeof m, "No se pudo abrir: curl %d  http %d%s", g_err, g_status,
+                         g_status == 403 || g_status == 404 ? "  (puede ser solo con DRM)" : "");
     status(m); sceKernelDelayThread(4000000); return;
   }
   vnet = calloc(1, sizeof(NetCtx));
@@ -1304,9 +1323,6 @@ static void play_channel(const Channel *c) {
 }
 
 // ---------- Buscador ----------
-static int view[MAX_CH], nview;   // canales que coinciden con la busqueda
-static char query[128];
-
 // minusculas y sin acentos, para comparar ("Accion" encuentra "Acción")
 static void fold(const char *s, char *o, int cap) {
   int i = 0;
@@ -1326,16 +1342,6 @@ static void fold(const char *s, char *o, int cap) {
     u++;
   }
   o[i] = 0;
-}
-
-static void build_view(void) {
-  char q[128], n[128];
-  fold(query, q, sizeof q);
-  nview = 0;
-  for (int i = 0; i < nchans; i++) {
-    if (q[0]) { fold(chans[i].name, n, sizeof n); if (!strstr(n, q)) continue; }
-    view[nview++] = i;
-  }
 }
 
 static void utf8_to_utf16(const char *s, SceWChar16 *o, int cap) {
@@ -1359,9 +1365,9 @@ static void utf16_to_utf8(const SceWChar16 *s, char *o, int cap) {
 }
 
 // Abre el teclado de la Vita; devuelve 1 si el usuario confirmo
-static int ime_search(void) {
+static int ime_search(char *query, int cap) {
   static SceWChar16 title[32], init[128], buf[128];
-  utf8_to_utf16("Buscar canal", title, 32);
+  utf8_to_utf16("Buscar", title, 32);
   utf8_to_utf16(query, init, 128);
   memset(buf, 0, sizeof buf);
   SceImeDialogParam ip;
@@ -1389,9 +1395,346 @@ static int ime_search(void) {
       break;
     }
   }
-  if (ok) utf16_to_utf8(buf, query, sizeof query);
-  sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;   // que la X del teclado no abra un canal
+  if (ok) utf16_to_utf8(buf, query, cap);
+  sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;   // que la X del teclado no abra nada
   return ok;
+}
+
+// ---------- Pantalla de lista generica (con buscador) ----------
+// Devuelve el indice elegido, o LS_BACK (O), LS_MODE (SELECT), LS_EXIT (START)
+enum { LS_BACK = -1, LS_MODE = -2, LS_EXIT = -3 };
+typedef struct { int sel, top; char query[128]; } ListState;
+
+static int list_screen(const char *title, const char *const *names, int n, ListState *ls, const char *hint) {
+  int *view = malloc(sizeof(int) * (n > 0 ? n : 1));
+  if (!view) return LS_BACK;
+  int nview = 0, rebuild = 1, ret = LS_BACK;
+  const int rows = 14;
+  for (;;) {
+    if (rebuild) {
+      char q[128], nm[160];
+      fold(ls->query, q, sizeof q);
+      nview = 0;
+      for (int i = 0; i < n; i++) {
+        if (q[0]) { fold(names[i], nm, sizeof nm); if (!strstr(nm, q)) continue; }
+        view[nview++] = i;
+      }
+      if (ls->sel >= nview) ls->sel = nview > 0 ? nview - 1 : 0;
+      rebuild = 0;
+    }
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    unsigned p = pad.buttons & ~oldpad.buttons; oldpad = pad;
+    if ((p & SCE_CTRL_DOWN) && ls->sel < nview - 1) ls->sel++;
+    if ((p & SCE_CTRL_UP) && ls->sel > 0) ls->sel--;
+    if (p & SCE_CTRL_RTRIGGER) ls->sel = ls->sel + rows < nview ? ls->sel + rows : nview - 1;
+    if (p & SCE_CTRL_LTRIGGER) ls->sel = ls->sel - rows > 0 ? ls->sel - rows : 0;
+    if (ls->sel < 0) ls->sel = 0;
+    if (ls->sel < ls->top) ls->top = ls->sel;
+    if (ls->sel >= ls->top + rows) ls->top = ls->sel - rows + 1;
+    if ((p & SCE_CTRL_CROSS) && nview > 0) { ret = view[ls->sel]; break; }
+    if (p & SCE_CTRL_CIRCLE) { ret = LS_BACK; break; }
+    if (p & SCE_CTRL_SELECT) { ret = LS_MODE; break; }
+    if (p & SCE_CTRL_START) { ret = LS_EXIT; break; }
+    if (p & SCE_CTRL_TRIANGLE) { if (ime_search(ls->query, sizeof ls->query)) { ls->sel = ls->top = 0; rebuild = 1; } continue; }
+    if ((p & SCE_CTRL_SQUARE) && ls->query[0]) { ls->query[0] = 0; ls->sel = ls->top = 0; rebuild = 1; }
+
+    vita2d_start_drawing(); vita2d_clear_screen();
+    vita2d_draw_rectangle(0, 0, 960, 50, RGBA8(30,30,120,255));
+    vita2d_pgf_draw_text(pgf, 20, 34, RGBA8(255,255,255,255), 1.2f, title);
+    char hdr[200];
+    if (ls->query[0]) snprintf(hdr, sizeof hdr, "Buscar: %s  (%d)", ls->query, nview);
+    else snprintf(hdr, sizeof hdr, "%d", n);
+    vita2d_pgf_draw_text(pgf, 960 - 20 - vita2d_pgf_text_width(pgf, 1.0f, hdr), 34, RGBA8(255,230,120,255), 1.0f, hdr);
+    for (int i = 0; i < rows && ls->top + i < nview; i++) {
+      int y = 66 + i * 31, idx = ls->top + i;
+      if (idx == ls->sel) vita2d_draw_rectangle(10, y - 4, 940, 30, RGBA8(70,70,200,255));
+      vita2d_pgf_draw_text(pgf, 24, y + 18, RGBA8(255,255,255,255), 1.0f, names[view[idx]]);
+    }
+    if (nview == 0) vita2d_pgf_draw_text(pgf, 24, 100, RGBA8(255,200,200,255), 1.0f,
+                                         ls->query[0] ? "Sin resultados. CUADRADO: ver todos" : "Lista vacia");
+    vita2d_pgf_draw_text(pgf, 20, 512, RGBA8(180,180,180,255), 0.85f, hint);
+    vita2d_pgf_draw_text(pgf, 20, 536, RGBA8(180,180,180,255), 0.85f,
+                         ls->query[0] ? "TRIANGULO: buscar   CUADRADO: ver todos   L/R: pagina   START: salir"
+                                      : "TRIANGULO: buscar   L/R: pagina   START: salir");
+    vita2d_end_drawing(); vita2d_swap_buffers();
+  }
+  free(view);
+  return ret;
+}
+
+static void show_error(const char *what) {
+  char m[220];
+  snprintf(m, sizeof m, "%s: http %d  curl %d  (O = volver)", what, g_status, g_err);
+  for (;;) {
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    unsigned p = pad.buttons & ~oldpad.buttons; oldpad = pad;
+    if (p & (SCE_CTRL_CIRCLE | SCE_CTRL_CROSS)) break;
+    status(m);
+  }
+}
+
+// ---------- JSON minimo (recorre el texto sin copiarlo) ----------
+static const char *jws(const char *p) { while (p && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; return p; }
+
+static const char *jskip(const char *p) {          // salta un valor completo
+  p = jws(p);
+  if (!p || !*p) return NULL;
+  if (*p == '"') { p++; while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; } return *p ? p + 1 : NULL; }
+  if (*p == '{' || *p == '[') {
+    int depth = 0;
+    while (*p) {
+      if (*p == '"') { p++; while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; } if (!*p) return NULL; }
+      else if (*p == '{' || *p == '[') depth++;
+      else if (*p == '}' || *p == ']') { if (--depth == 0) return p + 1; }
+      p++;
+    }
+    return NULL;
+  }
+  while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') p++;
+  return p;
+}
+
+// valor de "key" dentro del objeto que empieza en p (solo hijos directos)
+static const char *jget(const char *p, const char *key) {
+  p = jws(p);
+  if (!p || *p != '{') return NULL;
+  int kl = strlen(key);
+  p++;
+  for (;;) {
+    p = jws(p);
+    if (!p || *p != '"') return NULL;
+    const char *k = p + 1;
+    const char *ke = jskip(p);
+    if (!ke) return NULL;
+    int match = (ke - 1 - k) == kl && !strncmp(k, key, kl);
+    p = jws(ke);
+    if (!p || *p != ':') return NULL;
+    p = jws(p + 1);
+    if (match) return p;
+    p = jws(jskip(p));
+    if (!p || *p != ',') return NULL;
+    p++;
+  }
+}
+
+// busca "key" a cualquier profundidad (primer resultado cuyo valor sea del tipo pedido: '[' '{' o 0 = cualquiera)
+static const char *jfind(const char *p, const char *key, char want, int depth) {
+  p = jws(p);
+  if (!p || depth > 8) return NULL;
+  if (*p == '{') {
+    const char *v = jget(p, key);
+    if (v && (!want || *v == want)) return v;
+    p++;
+    for (;;) {
+      p = jws(p);
+      if (!p || *p != '"') return NULL;
+      p = jws(jskip(p)); if (!p || *p != ':') return NULL;
+      p = jws(p + 1);
+      const char *r = jfind(p, key, want, depth + 1);
+      if (r) return r;
+      p = jws(jskip(p));
+      if (!p || *p != ',') return NULL;
+      p++;
+    }
+  }
+  if (*p == '[') {
+    p = jws(p + 1);
+    while (p && *p && *p != ']') {
+      const char *r = jfind(p, key, want, depth + 1);
+      if (r) return r;
+      p = jws(jskip(p));
+      if (!p || *p != ',') break;
+      p = jws(p + 1);
+    }
+  }
+  return NULL;
+}
+
+static const char *jarr_first(const char *p) { p = jws(p); if (!p || *p != '[') return NULL; p = jws(p + 1); return (p && *p && *p != ']') ? p : NULL; }
+static const char *jarr_next(const char *p) { p = jws(jskip(p)); if (!p || *p != ',') return NULL; p = jws(p + 1); return (p && *p && *p != ']') ? p : NULL; }
+
+// copia el texto (o numero) de un valor
+static void jstr(const char *v, char *dst, int cap) {
+  dst[0] = 0;
+  v = jws(v);
+  if (!v) return;
+  if (*v == '"') { copy_json(v + 1, dst, cap); return; }
+  int i = 0;
+  while (*v && *v != ',' && *v != '}' && *v != ']' && i < cap - 1) dst[i++] = *v++;
+  dst[i] = 0;
+}
+static void jfield(const char *obj, const char *k1, const char *k2, char *dst, int cap) {
+  const char *v = jget(obj, k1);
+  if (!v && k2) v = jget(obj, k2);
+  if (v) jstr(v, dst, cap); else dst[0] = 0;
+}
+
+// ---------- Catalogo a la carta ----------
+typedef struct { char id[40]; char name[96]; int kind; } Entry;     // kind: 0 categoria, 1 pelicula, 2 serie, 3 episodio
+typedef struct { Entry *e; const char **names; int n, cap; } EntryList;
+
+static void el_free(EntryList *l) { free(l->e); free(l->names); memset(l, 0, sizeof *l); }
+static Entry *el_add(EntryList *l) {
+  if (l->n == l->cap) {
+    int nc = l->cap ? l->cap * 2 : 64;
+    Entry *ne = realloc(l->e, sizeof(Entry) * nc);
+    if (!ne) return NULL;
+    l->e = ne; l->cap = nc;
+  }
+  memset(&l->e[l->n], 0, sizeof(Entry));
+  return &l->e[l->n++];
+}
+static void el_names(EntryList *l) {
+  free(l->names);
+  l->names = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
+  if (l->names) for (int i = 0; i < l->n; i++) l->names[i] = l->e[i].name;
+}
+
+// arreglo de objetos: el de la clave pedida, o el documento si ya es un arreglo
+static const char *find_list(const char *doc, const char *key) {
+  const char *p = jws(doc);
+  if (p && *p == '[') return p;
+  return jfind(doc, key, '[', 0);
+}
+
+static void add_items(EntryList *l, const char *arr) {
+  for (const char *it = jarr_first(arr); it; it = jarr_next(it)) {
+    if (*jws(it) != '{') continue;
+    Entry *e = el_add(l); if (!e) break;
+    char type[24];
+    jfield(it, "_id", "id", e->id, sizeof e->id);
+    jfield(it, "name", "title", e->name, sizeof e->name);
+    jfield(it, "type", NULL, type, sizeof type);
+    e->kind = !strcmp(type, "series") ? 2 : 1;
+    if (!e->id[0] || !e->name[0]) { l->n--; continue; }
+    if (e->kind == 2) {                              // marca las series para distinguirlas
+      char tmp[96]; snprintf(tmp, sizeof tmp, "[Serie] %s", e->name);
+      snprintf(e->name, sizeof e->name, "%s", tmp);
+    }
+  }
+}
+
+static char *vod_doc;            // respuesta de categorias (se guarda: en v3 trae las peliculas dentro)
+static EntryList vod_cats;
+static int vod_v3;
+
+static int load_categories(void) {
+  if (vod_cats.n) return 0;
+  status("Descargando catalogo...");
+  vod_v3 = 0;
+  vod_doc = http_req(VOD_CATS_V4, NULL, 1);
+  const char *arr = vod_doc ? find_list(vod_doc, "categories") : NULL;
+  if (!arr) {                                     // respaldo: API v3
+    free(vod_doc);
+    vod_doc = http_req(VOD_CATS_V3, NULL, 0);
+    arr = vod_doc ? find_list(vod_doc, "categories") : NULL;
+    vod_v3 = 1;
+  }
+  if (!arr) { free(vod_doc); vod_doc = NULL; return -1; }
+  for (const char *c = jarr_first(arr); c; c = jarr_next(c)) {
+    if (*jws(c) != '{') continue;
+    Entry *e = el_add(&vod_cats); if (!e) break;
+    jfield(c, "_id", "id", e->id, sizeof e->id);
+    jfield(c, "name", "title", e->name, sizeof e->name);
+    e->kind = 0;
+    if (!e->id[0] || !e->name[0]) vod_cats.n--;
+  }
+  el_names(&vod_cats);
+  return vod_cats.n ? 0 : -1;
+}
+
+// Peliculas y series de una categoria
+static int load_items(int ci, EntryList *out) {
+  memset(out, 0, sizeof *out);
+  const char *arr = NULL;
+  // en v3 las peliculas vienen dentro de la categoria
+  if (vod_doc) {
+    const char *cats = find_list(vod_doc, "categories");
+    for (const char *c = jarr_first(cats); c; c = jarr_next(c)) {
+      if (*jws(c) != '{') continue;
+      char id[40]; jfield(c, "_id", "id", id, sizeof id);
+      if (!strcmp(id, vod_cats.e[ci].id)) { const char *it = jget(c, "items"); if (it && *jws(it) == '[') arr = it; break; }
+    }
+  }
+  if (arr) { add_items(out, arr); el_names(out); return out->n ? 0 : -1; }
+  status("Descargando titulos...");
+  char url[512]; snprintf(url, sizeof url, VOD_ITEMS_V4, vod_cats.e[ci].id);
+  char *doc = http_req(url, NULL, 1);
+  if (!doc) return -1;
+  arr = find_list(doc, "items");
+  if (arr) add_items(out, arr);
+  free(doc);
+  el_names(out);
+  return out->n ? 0 : -1;
+}
+
+// Episodios de una serie (todas las temporadas, "T1 E3 - Nombre")
+static int load_episodes(const char *series_id, EntryList *out) {
+  memset(out, 0, sizeof *out);
+  status("Descargando episodios...");
+  char url[512]; snprintf(url, sizeof url, VOD_SEASONS_V4, series_id);
+  char *doc = http_req(url, NULL, 1);
+  const char *seasons = doc ? find_list(doc, "seasons") : NULL;
+  if (!seasons) {
+    free(doc);
+    snprintf(url, sizeof url, VOD_SEASONS_V3, series_id);
+    doc = http_req(url, NULL, 0);
+    seasons = doc ? find_list(doc, "seasons") : NULL;
+  }
+  if (!seasons) { free(doc); return -1; }
+  for (const char *se = jarr_first(seasons); se; se = jarr_next(se)) {
+    if (*jws(se) != '{') continue;
+    char snum[16]; jfield(se, "number", NULL, snum, sizeof snum);
+    const char *eps = jget(se, "episodes");
+    for (const char *ep = jarr_first(eps); ep; ep = jarr_next(ep)) {
+      if (*jws(ep) != '{') continue;
+      Entry *e = el_add(out); if (!e) break;
+      char nm[96], en[16];
+      jfield(ep, "_id", "id", e->id, sizeof e->id);
+      jfield(ep, "name", "title", nm, sizeof nm);
+      jfield(ep, "number", NULL, en, sizeof en);
+      snprintf(e->name, sizeof e->name, "T%s E%s - %s", snum[0] ? snum : "?", en[0] ? en : "?", nm);
+      e->kind = 3;
+      if (!e->id[0]) out->n--;
+    }
+  }
+  free(doc);
+  el_names(out);
+  return out->n ? 0 : -1;
+}
+
+// Navegador: categorias -> titulos -> (serie) episodios. Devuelve LS_MODE o LS_EXIT.
+static int vod_browse(void) {
+  static ListState cat_ls;
+  if (load_categories() < 0) { show_error("No se pudo bajar el catalogo"); return LS_MODE; }
+  for (;;) {
+    int ci = list_screen("A la carta: categorias", vod_cats.names, vod_cats.n, &cat_ls,
+                         "X: abrir   SELECT: canales en vivo");
+    if (ci == LS_MODE || ci == LS_EXIT) return ci;
+    if (ci == LS_BACK) return LS_MODE;
+    EntryList items; ListState item_ls; memset(&item_ls, 0, sizeof item_ls);
+    if (load_items(ci, &items) < 0) { el_free(&items); show_error("Categoria vacia o sin acceso"); continue; }
+    char title[160]; snprintf(title, sizeof title, "A la carta: %s", vod_cats.e[ci].name);
+    for (;;) {
+      int ii = list_screen(title, items.names, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo");
+      if (ii == LS_MODE || ii == LS_EXIT) { el_free(&items); return ii; }
+      if (ii == LS_BACK) break;
+      Entry *it = &items.e[ii];
+      if (it->kind == 1) { play_stream("episode", it->id); continue; }   // las peliculas tambien van por "episode"
+      EntryList eps; ListState ep_ls; memset(&ep_ls, 0, sizeof ep_ls);
+      char sid_copy[40]; snprintf(sid_copy, sizeof sid_copy, "%s", it->id);
+      if (load_episodes(sid_copy, &eps) < 0) { el_free(&eps); show_error("No se pudieron bajar los episodios"); continue; }
+      char t2[160]; snprintf(t2, sizeof t2, "%s", it->name);
+      for (;;) {
+        int ei = list_screen(t2, eps.names, eps.n, &ep_ls, "X: ver   O: volver   SELECT: en vivo");
+        if (ei == LS_MODE || ei == LS_EXIT) { el_free(&eps); el_free(&items); return ei; }
+        if (ei == LS_BACK) break;
+        play_stream("episode", eps.e[ei].id);
+      }
+      el_free(&eps);
+    }
+    el_free(&items);
+  }
 }
 
 // ---------- Main ----------
@@ -1420,40 +1763,21 @@ int main(void) {
     char m[200]; snprintf(m, sizeof m, "Error canales: paso %d  codigo 0x%08X  http %d", g_step, (unsigned)g_err, g_status);
     status(m); sceKernelDelayThread(15000000); goto out; }
 
-  query[0] = 0; build_view();
-  int sel = 0, top = 0; const int rows = 14;
+  static const char *chan_names[MAX_CH];
+  for (int i = 0; i < nchans; i++) chan_names[i] = chans[i].name;
+  static ListState live_ls;
+  int mode = 0;                                  // 0 en vivo, 1 a la carta
   for (;;) {
-    sceCtrlPeekBufferPositive(0, &pad, 1);
-    unsigned p = pad.buttons & ~oldpad.buttons; oldpad = pad;
-    if ((p & SCE_CTRL_DOWN) && sel < nview - 1) sel++;
-    if ((p & SCE_CTRL_UP) && sel > 0) sel--;
-    if (p & SCE_CTRL_RTRIGGER) sel = sel + rows < nview ? sel + rows : nview - 1;
-    if (p & SCE_CTRL_LTRIGGER) sel = sel - rows > 0 ? sel - rows : 0;
-    if (sel < 0) sel = 0;
-    if (sel < top) top = sel;
-    if (sel >= top + rows) top = sel - rows + 1;
-    if ((p & SCE_CTRL_CROSS) && nview > 0) { play_channel(&chans[view[sel]]); continue; }
-    if (p & SCE_CTRL_TRIANGLE) { if (ime_search()) { build_view(); sel = top = 0; } continue; }
-    if ((p & SCE_CTRL_SQUARE) && query[0]) { query[0] = 0; build_view(); sel = top = 0; }
-    if (p & SCE_CTRL_START) break;
-
-    vita2d_start_drawing(); vita2d_clear_screen();
-    vita2d_draw_rectangle(0, 0, 960, 50, RGBA8(30,30,120,255));
-    vita2d_pgf_draw_text(pgf, 20, 34, RGBA8(255,255,255,255), 1.3f, "Pluto TV para Vita");
-    if (query[0]) {
-      char hdr[200]; snprintf(hdr, sizeof hdr, "Buscar: %s  (%d)", query, nview);
-      vita2d_pgf_draw_text(pgf, 420, 34, RGBA8(255,230,120,255), 1.0f, hdr);
+    int r;
+    if (mode == 0) {
+      r = list_screen("Pluto TV: en vivo", chan_names, nchans, &live_ls, "X: ver   SELECT: peliculas y series");
+      if (r >= 0) { play_stream("channel", chans[r].id); continue; }
+      if (r == LS_MODE) mode = 1;
+    } else {
+      r = vod_browse();
+      if (r == LS_MODE) mode = 0;
     }
-    for (int i = 0; i < rows && top + i < nview; i++) {
-      int y = 70 + i * 31, idx = top + i;
-      if (idx == sel) vita2d_draw_rectangle(10, y - 4, 940, 30, RGBA8(70,70,200,255));
-      vita2d_pgf_draw_text(pgf, 24, y + 18, RGBA8(255,255,255,255), 1.0f, chans[view[idx]].name);
-    }
-    if (nview == 0) vita2d_pgf_draw_text(pgf, 24, 100, RGBA8(255,200,200,255), 1.0f, "Sin resultados. CUADRADO: ver todos");
-    vita2d_pgf_draw_text(pgf, 20, 535, RGBA8(180,180,180,255), 0.9f,
-                         query[0] ? "X: ver   TRIANGULO: buscar   CUADRADO: ver todos   L/R: pagina   START: salir"
-                                  : "X: ver   TRIANGULO: buscar   L/R: pagina   START: salir");
-    vita2d_end_drawing(); vita2d_swap_buffers();
+    if (r == LS_EXIT) break;
   }
 out:
   vita2d_fini();
