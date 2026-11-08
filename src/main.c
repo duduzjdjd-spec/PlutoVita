@@ -26,7 +26,7 @@
   "?advertisingId=&appName=web&appVersion=8.0.0&deviceDNT=0&deviceId=%s&deviceMake=chrome" \
   "&deviceModel=web&deviceType=web&deviceVersion=122.0.0&serverSideAds=false&sid=%s&jwt=%s"
 
-// Memoria para el heap de newlib (curl + mbedTLS necesitan bastante)
+// Memoria para el heap de newlib (curl + OpenSSL necesitan bastante)
 int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define MAX_CH 800
@@ -51,7 +51,7 @@ static void status(const char *msg) {
   vita2d_end_drawing(); vita2d_swap_buffers();
 }
 
-// ---------- HTTP (libcurl + mbedTLS) ----------
+// ---------- HTTP (libcurl + OpenSSL) ----------
 static int g_step = 0, g_err = 0, g_status = 0;
 struct mem { char *b; size_t n, cap; };
 
@@ -199,6 +199,7 @@ static void play_channel(const Channel *c) {
 // ---------- Main ----------
 int main(void) {
   sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+  sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
   static char netmem[1024 * 1024];
   SceNetInitParam np = { netmem, sizeof netmem, 0 };
   sceNetInit(&np); sceNetCtlInit();
