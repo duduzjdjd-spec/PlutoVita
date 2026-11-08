@@ -206,7 +206,8 @@ static void nap_ms(int ms) {
 // ---- Datos de depuracion (se muestran en pantalla) ----
 static struct {
   char variant[80];
-  int url2, jwt_added;
+  int url2, jwt_added, alt_audio;
+  char ts_types[48];
   int segs, seg_err, pl_err, pl_loads, http, curl;
   int enc_aes, enc_other, keys, key_err, dec_fail;
   char keymethod[24];
@@ -259,6 +260,7 @@ static int pick_variant(const char *m, const char *base, char *out, int cap) {
   long bw = 0; int h = 0, pending = 0, skip = 0, any = 0;
   const char *p = m;
   while ((p = next_line(p, line, sizeof line)) != NULL) {
+    if (!strncmp(line, "#EXT-X-MEDIA:", 13) && strstr(line, "TYPE=AUDIO") && strstr(line, "URI=")) st.alt_audio++;
     if (!strncmp(line, "#EXT-X-STREAM-INF:", 18)) {
       any = 1; pending = 1; skip = 0; bw = 0; h = 0;
       const char *b = strstr(line, "BANDWIDTH="); if (b) bw = atol(b + 10);
@@ -881,14 +883,18 @@ static void ts_packet(const uint8_t *p) {
     int sl = ((d[1] & 0x0F) << 8) | d[2];
     int pil = ((d[10] & 0x0F) << 8) | d[11];
     int end = 3 + sl - 4; if (end > n) end = n;
-    int nv = -1, na = -1;
+    int nv = -1, na = -1, tl = 0;
+    char types[48];
     for (int i = 12 + pil; i + 5 <= end; ) {
       int type = d[i], epid = ((d[i + 1] & 0x1F) << 8) | d[i + 2], il = ((d[i + 3] & 0x0F) << 8) | d[i + 4];
       if (type == 0x1B && nv < 0) nv = epid;
       if (type == 0x0F && na < 0) na = epid;
+      if (tl < (int)sizeof types - 4) tl += snprintf(types + tl, sizeof types - tl, "%02X ", type);
       i += 5 + il;
     }
     vpid = nv; apid = na;
+    types[tl] = 0;
+    if (strcmp(types, st.ts_types)) snprintf(st.ts_types, sizeof st.ts_types, "%s", types);
   } else if (pid == vpid || pid == apid) {
     Pes *pe = pid == vpid ? &vpes : &apes;
     if (pusi) { pes_flush(pe, pid == vpid); pes_start(pe, d, n); }
@@ -1011,7 +1017,8 @@ static void pick_frame(void) {
 
 static void draw_debug(int y0) {
   char l[200]; uint32_t col = RGBA8(255,255,0,255);
-  snprintf(l, sizeof l, "Calidad: %s   URL %s%s", st.variant, st.url2 ? "nueva" : "vieja", st.jwt_added ? "  +jwt" : "");
+  snprintf(l, sizeof l, "Calidad: %s   URL %s%s   audio aparte: %d", st.variant, st.url2 ? "nueva" : "vieja",
+           st.jwt_added ? "  +jwt" : "", st.alt_audio);
   vita2d_pgf_draw_text(pgf, 20, y0, col, 0.9f, l);
   snprintf(l, sizeof l, "Red: segmentos %d  errores %d  lista %d/%d  http %d  curl %d  cola %d",
            st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, sq_count);
@@ -1027,8 +1034,8 @@ static void draw_debug(int y0) {
   snprintf(l, sizeof l, "Video errores: %d (0x%08X)  init 0x%08X  pts %s  cola %d",
            st.dec_err, st.last_dec_err, st.vinit_err, use_pts ? "si" : "no", vq_count);
   vita2d_pgf_draw_text(pgf, 20, y0 + 78, col, 0.9f, l);
-  snprintf(l, sizeof l, "Audio: %d Hz %d ch  cuadros %d  tarde %d  errores %d (0x%08X)  cola %d",
-           st.arate, st.ach, st.aframes, st.alate, st.aerr, st.last_aerr, pcm_count);
+  snprintf(l, sizeof l, "Audio: %d Hz %d ch  cuadros %d  tarde %d  err %d (0x%08X)  cola %d  TS: %s",
+           st.arate, st.ach, st.aframes, st.alate, st.aerr, st.last_aerr, pcm_count, st.ts_types);
   vita2d_pgf_draw_text(pgf, 20, y0 + 104, col, 0.9f, l);
   if (st.msg[0]) vita2d_pgf_draw_text(pgf, 20, y0 + 130, RGBA8(255,120,120,255), 0.9f, st.msg);
 }
