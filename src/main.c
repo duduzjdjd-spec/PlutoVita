@@ -59,7 +59,7 @@ static char *http_get(const char *url, int *outlen) {
   g_step = 1; g_err = 0; g_status = 0;
   int tpl = sceHttpCreateTemplate("Mozilla/5.0 PlutoVita", SCE_HTTP_VERSION_1_1, 1);
   if (tpl < 0) { g_err = tpl; return NULL; }
-  sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY); // sin CA certs en Vita
+  sceHttpsDisableOption(0x3F); /* desactiva todas las verificaciones de certificado */ // sin CA certs en Vita
   g_step = 2;
   int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
   if (conn < 0) g_err = conn;
