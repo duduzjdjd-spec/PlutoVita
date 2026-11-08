@@ -71,7 +71,7 @@
 int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define MAX_CH 800
-typedef struct { char id[40]; char name[64]; } Channel;
+typedef struct { char id[40]; char name[64]; char logo[224]; } Channel;
 static Channel chans[MAX_CH];
 static int nchans = 0;
 static char uuid[40], sid[40];
@@ -120,8 +120,8 @@ static int xferinfo(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_
 }
 
 static char jwt[2048];
-static char *http_req(const char *url, int *outlen, int bearer) {
-  g_step = 1; g_err = 0; g_status = 0;
+static char *http_req_ex(const char *url, int *outlen, int bearer, int quiet) {
+  if (!quiet) { g_step = 1; g_err = 0; g_status = 0; }
   CURL *c = curl_easy_init();
   if (!c) { g_err = -1; return NULL; }
   struct curl_slist *hdr = NULL;
@@ -146,17 +146,23 @@ static char *http_req(const char *url, int *outlen, int bearer) {
   curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xferinfo);
   curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *)(intptr_t)seek_gen);
-  g_step = 4;
+  if (!quiet) g_step = 4;
   CURLcode rc = curl_easy_perform(c);
-  g_err = (int)rc;
-  long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st); g_status = (int)st;
+  long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
+  if (!quiet) { g_err = (int)rc; g_status = (int)st; }
   curl_easy_cleanup(c);
   if (hdr) curl_slist_free_all(hdr);
   if (rc != CURLE_OK || st >= 400) { free(m.b); return NULL; }
   if (outlen) *outlen = (int)m.n;
   return m.b;
 }
-static char *http_get(const char *url, int *outlen) { return http_req(url, outlen, 0); }
+static char *http_req(const char *url, int *outlen, int bearer) { return http_req_ex(url, outlen, bearer, 0); }
+static char *http_get(const char *url, int *outlen) { return http_req_ex(url, outlen, 0, 0); }
+
+// JSON minimo (definido mas abajo)
+static const char *jws(const char *p);
+static const char *jget(const char *p, const char *key);
+static void jstr(const char *v, char *dst, int cap);
 
 static int copy_str(const char *p, char *dst, int max) { // copia hasta la comilla
   int i = 0; while (*p && *p != '"' && i < max - 1) dst[i++] = *p++;
@@ -226,6 +232,10 @@ static int get_channels(void) {
     const char *nm = strstr(q, "\"name\":\"");
     if (!nm || nm - q > 300) continue;
     copy_json(nm + 8, c->name, sizeof c->name);
+    c->logo[0] = 0;
+    const char *lg = jget(p - 8, "colorLogoPNG");             // p-8 = la "{" del canal
+    if (!lg) lg = jget(p - 8, "logo");
+    if (lg && *jws(lg) == '{') { const char *pa = jget(lg, "path"); if (pa) jstr(pa, c->logo, sizeof c->logo); }
     if (c->id[0] && c->name[0]) nchans++;
   }
   free(r); return nchans > 0 ? 0 : -1;
@@ -1540,13 +1550,138 @@ static int ime_search(char *query, int cap) {
   return ok;
 }
 
+// ---------- Imagenes (logos y portadas) ----------
+// Un hilo baja las imagenes que pide la pantalla (la seleccionada primero) y las guarda como texturas.
+enum { IM_REQ = 1, IM_LOADING, IM_READY, IM_FAIL };
+typedef struct { char url[240]; vita2d_texture *tex; int state; uint32_t want, used; } Img;
+#define IMG_MAX 96
+static Img img_tab[IMG_MAX];
+static SceUID img_mtx = -1;
+static uint32_t img_tick, img_frame;
+static volatile int img_run;
+
+static void img_lock(void)   { sceKernelLockMutex(img_mtx, 1, NULL); }
+static void img_unlock(void) { sceKernelUnlockMutex(img_mtx, 1); }
+
+// Pide (si hace falta) y devuelve la textura si ya esta lista. Solo desde el hilo principal.
+static vita2d_texture *img_get(const char *url) {
+  if (!url || !url[0] || img_mtx < 0) return NULL;
+  vita2d_texture *t = NULL;
+  int freei = -1;
+  img_lock();
+  for (int i = 0; i < IMG_MAX; i++) {
+    Img *m = &img_tab[i];
+    if (!m->state) { if (freei < 0) freei = i; continue; }
+    if (!strcmp(m->url, url)) {
+      m->used = img_frame;
+      if (m->state == IM_READY) t = m->tex;
+      else if (m->state == IM_REQ) m->want = ++img_tick;
+      img_unlock();
+      return t;
+    }
+  }
+  if (freei >= 0) {
+    Img *m = &img_tab[freei];
+    snprintf(m->url, sizeof m->url, "%s", url);
+    m->tex = NULL; m->state = IM_REQ; m->want = ++img_tick; m->used = img_frame;
+  }
+  img_unlock();
+  return NULL;
+}
+
+// Libera las que no se ven hace rato. Llamar con la GPU detenida (despues de vita2d_wait_rendering_done).
+static void img_gc(void) {
+  if (img_mtx < 0) return;
+  img_frame++;
+  img_lock();
+  int used = 0;
+  for (int i = 0; i < IMG_MAX; i++) if (img_tab[i].state) used++;
+  while (used > IMG_MAX - 12) {
+    int v = -1;
+    for (int i = 0; i < IMG_MAX; i++) {
+      Img *m = &img_tab[i];
+      if (!m->state || m->state == IM_LOADING || img_frame - m->used < 30) continue;
+      if (v < 0 || (int32_t)(m->used - img_tab[v].used) < 0) v = i;
+    }
+    if (v < 0) break;
+    if (img_tab[v].tex) vita2d_free_texture(img_tab[v].tex);
+    memset(&img_tab[v], 0, sizeof img_tab[v]);
+    used--;
+  }
+  img_unlock();
+}
+
+static int img_thread(SceSize a, void *u) {
+  static char url[300];
+  while (img_run) {
+    if (playing) { sceKernelDelayThread(100000); continue; }      // durante el video no baja imagenes
+    int pick = -1;
+    img_lock();
+    for (int i = 0; i < IMG_MAX; i++) {
+      Img *m = &img_tab[i];
+      if (m->state != IM_REQ || img_frame - m->used > 2) continue;  // solo lo que se esta viendo
+      if (pick < 0 || m->want > img_tab[pick].want) pick = i;
+    }
+    if (pick >= 0) {
+      img_tab[pick].state = IM_LOADING;
+      // version chica (el servidor de imagenes de Pluto acepta w/h)
+      snprintf(url, sizeof url, "%s%cw=240&h=240&fit=max", img_tab[pick].url, strchr(img_tab[pick].url, '?') ? '&' : '?');
+    }
+    img_unlock();
+    if (pick < 0) { sceKernelDelayThread(30000); continue; }
+    vita2d_texture *t = NULL;
+    for (int attempt = 0; attempt < 2 && !t && img_run; attempt++) {
+      if (attempt == 1) {                    // sin la version chica, por si el servidor no la acepta
+        img_lock(); snprintf(url, sizeof url, "%s", img_tab[pick].url); img_unlock();
+      }
+      int n = 0;
+      uint8_t *d = (uint8_t *)http_req_ex(url, &n, 0, 1);
+      if (d && n > 8) {
+        if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') t = vita2d_load_PNG_buffer(d);
+        else if (d[0] == 0xFF && d[1] == 0xD8) t = vita2d_load_JPEG_buffer(d, n);
+      }
+      free(d);
+    }
+    if (t) vita2d_texture_set_filters(t, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    img_lock();
+    img_tab[pick].tex = t;
+    img_tab[pick].state = t ? IM_READY : IM_FAIL;
+    img_unlock();
+  }
+  return 0;
+}
+
+// Dibuja la textura dentro de la caja (x, y, w, h) sin deformarla
+static void draw_fit(vita2d_texture *t, float x, float y, float w, float h) {
+  float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
+  if (tw < 1 || th < 1) return;
+  float sc = w / tw < h / th ? w / tw : h / th;
+  vita2d_draw_texture_scale(t, x + (w - tw * sc) / 2, y + (h - th * sc) / 2, sc, sc);
+}
+
+// Recorta el texto para que quepa en "maxw" pixeles
+static const char *fit_text(const char *s, float scale, float maxw, char *buf, int cap) {
+  if (vita2d_pgf_text_width(pgf, scale, s) <= maxw) return s;
+  snprintf(buf, cap, "%s", s);
+  int n = strlen(buf);
+  while (n > 0) {
+    n--; while (n > 0 && ((unsigned char)buf[n] & 0xC0) == 0x80) n--;   // no partir letras con acento
+    buf[n] = 0;
+    char t[200]; snprintf(t, sizeof t, "%s...", buf);
+    if (vita2d_pgf_text_width(pgf, scale, t) <= maxw) { snprintf(buf, cap, "%s", t); break; }
+  }
+  return buf;
+}
+
 // ---------- Pantalla de lista generica (con buscador) ----------
 // Devuelve el indice elegido, o LS_BACK (O), LS_MODE (SELECT), LS_EXIT (START)
 enum { LS_BACK = -1, LS_MODE = -2, LS_EXIT = -3, LS_SEARCH = -4 };
 typedef struct { int sel, top; char query[128]; } ListState;
 
 // global_search: TRIANGULO no filtra esta lista, devuelve LS_SEARCH para que el llamador busque en todo
-static int list_screen_ex(const char *title, const char *const *names, const char *const *keys, int n, ListState *ls, const char *hint, int global_search) {
+// imgs: URL de imagen por elemento (o NULL). logos: 1 = logos de canal (tambien en cada fila), 0 = portadas
+static int list_screen_img(const char *title, const char *const *names, const char *const *keys, const char *const *imgs, int logos,
+                           int n, ListState *ls, const char *hint, int global_search) {
   int *view = malloc(sizeof(int) * (n > 0 ? n : 1));
   if (!view) return LS_BACK;
   int nview = 0, rebuild = 1, ret = LS_BACK;
@@ -1580,6 +1715,8 @@ static int list_screen_ex(const char *title, const char *const *names, const cha
     if (p & SCE_CTRL_TRIANGLE) { if (ime_search(ls->query, sizeof ls->query)) { ls->sel = ls->top = 0; rebuild = 1; } continue; }
     if ((p & SCE_CTRL_SQUARE) && ls->query[0]) { ls->query[0] = 0; ls->sel = ls->top = 0; rebuild = 1; }
 
+    vita2d_wait_rendering_done();       // la GPU termino el cuadro anterior: ya se pueden liberar imagenes
+    img_gc();
     vita2d_start_drawing(); vita2d_clear_screen();
     vita2d_draw_rectangle(0, 0, 960, 50, RGBA8(30,30,120,255));
     vita2d_pgf_draw_text(pgf, 20, 34, RGBA8(255,255,255,255), 1.2f, title);
@@ -1587,10 +1724,26 @@ static int list_screen_ex(const char *title, const char *const *names, const cha
     if (ls->query[0]) snprintf(hdr, sizeof hdr, "Buscar: %s  (%d)", ls->query, nview);
     else snprintf(hdr, sizeof hdr, "%d", n);
     vita2d_pgf_draw_text(pgf, 960 - 20 - vita2d_pgf_text_width(pgf, 1.0f, hdr), 34, RGBA8(255,230,120,255), 1.0f, hdr);
+    float listw = imgs ? 600 : 940, tx = (imgs && logos) ? 78 : 24;
+    char cut[200];
     for (int i = 0; i < rows && ls->top + i < nview; i++) {
       int y = 66 + i * 31, idx = ls->top + i;
-      if (idx == ls->sel) vita2d_draw_rectangle(10, y - 4, 940, 30, RGBA8(70,70,200,255));
-      vita2d_pgf_draw_text(pgf, 24, y + 18, RGBA8(255,255,255,255), 1.0f, names[view[idx]]);
+      if (idx == ls->sel) vita2d_draw_rectangle(10, y - 4, listw, 30, RGBA8(70,70,200,255));
+      if (imgs && logos) {                                   // logo chico en cada fila
+        vita2d_texture *t = img_get(imgs[view[idx]]);
+        if (t) draw_fit(t, 16, y - 3, 54, 28);
+      }
+      vita2d_pgf_draw_text(pgf, tx, y + 18, RGBA8(255,255,255,255), 1.0f,
+                           fit_text(names[view[idx]], 1.0f, listw - tx, cut, sizeof cut));
+    }
+    if (imgs && nview > 0) {                                 // imagen grande del seleccionado
+      vita2d_draw_rectangle(625, 62, 320, 432, RGBA8(25,25,45,255));
+      vita2d_texture *t = img_get(imgs[view[ls->sel]]);
+      if (t) draw_fit(t, 635, 72, 300, logos ? 220 : 412);
+      else vita2d_pgf_draw_text(pgf, 700, 270, RGBA8(120,120,150,255), 1.0f,
+                                imgs[view[ls->sel]] && imgs[view[ls->sel]][0] ? "Cargando imagen..." : "Sin imagen");
+      if (logos) vita2d_pgf_draw_text(pgf, 640, 330, RGBA8(255,255,255,255), 1.0f,
+                                      fit_text(names[view[ls->sel]], 1.0f, 295, cut, sizeof cut));
     }
     if (nview == 0) vita2d_pgf_draw_text(pgf, 24, 100, RGBA8(255,200,200,255), 1.0f,
                                          ls->query[0] ? "Sin resultados. CUADRADO: ver todos" : "Lista vacia");
@@ -1602,6 +1755,9 @@ static int list_screen_ex(const char *title, const char *const *names, const cha
   }
   free(view);
   return ret;
+}
+static int list_screen_ex(const char *title, const char *const *names, const char *const *keys, int n, ListState *ls, const char *hint, int global_search) {
+  return list_screen_img(title, names, keys, NULL, 0, n, ls, hint, global_search);
 }
 static int list_screen(const char *title, const char *const *names, int n, ListState *ls, const char *hint) {
   return list_screen_ex(title, names, NULL, n, ls, hint, 0);
@@ -1715,11 +1871,11 @@ static void jfield(const char *obj, const char *k1, const char *k2, char *dst, i
 }
 
 // ---------- Catalogo a la carta ----------
-typedef struct { char id[40]; char name[104]; char title[96]; int kind; } Entry;   // kind: 0 categoria, 1 pelicula, 2 serie, 3 episodio
+typedef struct { char id[40]; char name[104]; char title[96]; char img[224]; int kind; } Entry;   // kind: 0 categoria, 1 pelicula, 2 serie, 3 episodio
 // name = lo que se muestra ("[Serie] X"); title = solo el titulo (con eso se busca)
-typedef struct { Entry *e; const char **names, **keys; int n, cap; } EntryList;
+typedef struct { Entry *e; const char **names, **keys, **imgs; int n, cap; } EntryList;
 
-static void el_free(EntryList *l) { free(l->e); free(l->names); free(l->keys); memset(l, 0, sizeof *l); }
+static void el_free(EntryList *l) { free(l->e); free(l->names); free(l->keys); free(l->imgs); memset(l, 0, sizeof *l); }
 static Entry *el_add(EntryList *l) {
   if (l->n == l->cap) {
     int nc = l->cap ? l->cap * 2 : 64;
@@ -1731,9 +1887,11 @@ static Entry *el_add(EntryList *l) {
   return &l->e[l->n++];
 }
 static void el_names(EntryList *l) {
-  free(l->names); free(l->keys);
+  free(l->names); free(l->keys); free(l->imgs);
   l->names = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
   l->keys  = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
+  l->imgs  = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
+  if (l->imgs)  for (int i = 0; i < l->n; i++) l->imgs[i] = l->e[i].img;
   if (l->names) for (int i = 0; i < l->n; i++) l->names[i] = l->e[i].name;
   if (l->keys)  for (int i = 0; i < l->n; i++) l->keys[i] = l->e[i].title[0] ? l->e[i].title : l->e[i].name;
 }
@@ -1745,6 +1903,39 @@ static const char *find_list(const char *doc, const char *key) {
   return jfind(doc, key, '[', 0);
 }
 
+// Portada de un titulo: covers (prefiere la vertical 347:500), luego poster/featuredImage/tile, luego images
+static void find_cover(const char *obj, char *out, int cap) {
+  out[0] = 0;
+  if (!obj) return;
+  const char *cv = jget(obj, "covers");
+  if (cv && *jws(cv) == '[') {
+    for (const char *c = jarr_first(cv); c; c = jarr_next(c)) {
+      if (*jws(c) != '{') continue;
+      char ar[24], u[224];
+      jfield(c, "aspectRatio", NULL, ar, sizeof ar);
+      jfield(c, "url", "path", u, sizeof u);
+      if (!u[0]) continue;
+      if (!out[0] || !strcmp(ar, "347:500")) snprintf(out, cap, "%s", u);
+      if (!strcmp(ar, "347:500")) return;
+    }
+    if (out[0]) return;
+  }
+  const char *keys[] = { "poster", "featuredImage", "tile", "featuredImageMobile" };
+  for (int k = 0; k < 4; k++) {
+    const char *o = jget(obj, keys[k]);
+    if (o && *jws(o) == '{') { jfield(o, "path", "url", out, cap); if (out[0]) return; }
+    if (o && *jws(o) == '"') { jstr(o, out, cap); if (out[0]) return; }
+  }
+  const char *im = jget(obj, "images");
+  if (im && *jws(im) == '[') {
+    for (const char *c = jarr_first(im); c; c = jarr_next(c)) {
+      if (*jws(c) != '{') continue;
+      char u[224]; jfield(c, "url", "path", u, sizeof u);
+      if (u[0]) { snprintf(out, cap, "%s", u); return; }
+    }
+  }
+}
+
 static int el_has(const EntryList *l, const char *id) {
   for (int i = 0; i < l->n; i++) if (!strcmp(l->e[i].id, id)) return 1;
   return 0;
@@ -1754,9 +1945,10 @@ static int el_has(const EntryList *l, const char *id) {
 static void add_items(EntryList *l, const char *arr) {
   for (const char *it = jarr_first(arr); it; it = jarr_next(it)) {
     if (*jws(it) != '{') continue;
-    char type[24], id[40], title[96];
+    char type[24], id[40], title[96], img[224];
     jfield(it, "type", NULL, type, sizeof type);
     int kind;
+    const char *src = it;                                         // de donde sale la portada
     if (!strcmp(type, "series")) {
       kind = 2;
       jfield(it, "_id", "id", id, sizeof id);
@@ -1768,12 +1960,14 @@ static void add_items(EntryList *l, const char *arr) {
     } else if (!strcmp(type, "episode")) {
       const char *ser = jget(it, "series");                       // datos de su serie, si vienen
       if (!ser || *jws(ser) != '{') continue;
-      kind = 2;
+      kind = 2; src = ser;
       jfield(ser, "_id", "id", id, sizeof id);
       jfield(ser, "name", "title", title, sizeof title);
     } else continue;                                              // clips, avances, etc.
     if (!id[0] || !title[0] || el_has(l, id)) continue;
+    find_cover(src, img, sizeof img);
     Entry *e = el_add(l); if (!e) break;
+    snprintf(e->img, sizeof e->img, "%s", img);
     snprintf(e->id, sizeof e->id, "%s", id);
     snprintf(e->title, sizeof e->title, "%s", title);
     if (kind == 2) snprintf(e->name, sizeof e->name, "[Serie] %s", title);
@@ -1942,7 +2136,7 @@ static int global_search(void) {
   snprintf(res_ls.query, sizeof res_ls.query, "%s", q);
   res_ls.sel = res_ls.top = 0;
   for (;;) {
-    int r = list_screen_ex("Buscar pelicula o serie", all_items.names, all_items.keys, all_items.n, &res_ls,
+    int r = list_screen_img("Buscar pelicula o serie", all_items.names, all_items.keys, all_items.imgs, 0, all_items.n, &res_ls,
                            cancelled ? "Busqueda parcial (se cancelo el recorrido)   X: ver / abrir   O: categorias"
                                      : "X: ver / abrir serie   O: categorias   SELECT: en vivo", 0);
     if (r == LS_MODE || r == LS_EXIT) return r;
@@ -1967,7 +2161,7 @@ static int vod_browse(void) {
     if (load_items(ci, &items, 0) < 0) { el_free(&items); show_error("Categoria vacia o sin acceso"); continue; }
     char title[160]; snprintf(title, sizeof title, "A la carta: %s", vod_cats.e[ci].name);
     for (;;) {
-      int ii = list_screen_ex(title, items.names, items.keys, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo", 0);
+      int ii = list_screen_img(title, items.names, items.keys, items.imgs, 0, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo", 0);
       if (ii == LS_MODE || ii == LS_EXIT) { el_free(&items); return ii; }
       if (ii == LS_BACK) break;
       Entry it = items.e[ii];
@@ -2004,14 +2198,18 @@ int main(void) {
     char m[200]; snprintf(m, sizeof m, "Error canales: paso %d  codigo 0x%08X  http %d", g_step, (unsigned)g_err, g_status);
     status(m); sceKernelDelayThread(15000000); goto out; }
 
-  static const char *chan_names[MAX_CH];
-  for (int i = 0; i < nchans; i++) chan_names[i] = chans[i].name;
+  static const char *chan_names[MAX_CH], *chan_logos[MAX_CH];
+  for (int i = 0; i < nchans; i++) { chan_names[i] = chans[i].name; chan_logos[i] = chans[i].logo; }
+  img_mtx = sceKernelCreateMutex("pv_img", 0, 0, NULL);
+  img_run = 1;
+  SceUID th_img = sceKernelCreateThread("pv_img", img_thread, 0x10000100, 256 * 1024, 0, 0, NULL);
+  sceKernelStartThread(th_img, 0, NULL);
   static ListState live_ls;
   int mode = 0;                                  // 0 en vivo, 1 a la carta
   for (;;) {
     int r;
     if (mode == 0) {
-      r = list_screen("Pluto TV: en vivo", chan_names, nchans, &live_ls, "X: ver   SELECT: peliculas y series");
+      r = list_screen_img("Pluto TV: en vivo", chan_names, NULL, chan_logos, 1, nchans, &live_ls, "X: ver   SELECT: peliculas y series", 0);
       if (r >= 0) { play_stream("channel", chans[r].id); continue; }
       if (r == LS_MODE) mode = 1;
     } else {
@@ -2020,6 +2218,8 @@ int main(void) {
     }
     if (r == LS_EXIT) break;
   }
+  img_run = 0;
+  sceKernelWaitThreadEnd(th_img, NULL, NULL);
 out:
   vita2d_fini();
   curl_global_cleanup(); sceNetCtlTerm(); sceNetTerm();
