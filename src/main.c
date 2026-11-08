@@ -28,6 +28,8 @@
 #include <psp2/audiodec.h>
 #include <psp2/videodec.h>
 #include <psp2/gxm.h>
+#include <psp2/ime_dialog.h>
+#include <psp2/apputil.h>
 #include <curl/curl.h>
 #include <openssl/evp.h>
 #include <vita2d.h>
@@ -142,16 +144,37 @@ static int copy_str(const char *p, char *dst, int max) { // copia hasta la comil
   dst[i] = 0; return i;
 }
 
-// Copia un texto JSON hasta la comilla final, resolviendo \u0026, \/ y \"
+// Escribe un caracter Unicode en UTF-8
+static int put_utf8(char *d, int room, unsigned cp) {
+  if (cp < 0x80)    { if (room < 1) return 0; d[0] = cp; return 1; }
+  if (cp < 0x800)   { if (room < 2) return 0; d[0] = 0xC0 | (cp >> 6); d[1] = 0x80 | (cp & 0x3F); return 2; }
+  if (cp < 0x10000) { if (room < 3) return 0; d[0] = 0xE0 | (cp >> 12); d[1] = 0x80 | ((cp >> 6) & 0x3F); d[2] = 0x80 | (cp & 0x3F); return 3; }
+  if (room < 4) return 0;
+  d[0] = 0xF0 | (cp >> 18); d[1] = 0x80 | ((cp >> 12) & 0x3F); d[2] = 0x80 | ((cp >> 6) & 0x3F); d[3] = 0x80 | (cp & 0x3F);
+  return 4;
+}
+
+// Copia un texto JSON hasta la comilla final, resolviendo los escapes (á, \/, \", ...)
 static void copy_json(const char *p, char *dst, int max) {
   int i = 0;
   while (*p && *p != '"' && i < max - 1) {
     if (*p == '\\' && p[1]) {
       if (p[1] == 'u' && p[2] && p[3] && p[4] && p[5]) {
         char hx[5] = { p[2], p[3], p[4], p[5], 0 };
-        dst[i++] = (char)strtol(hx, NULL, 16); p += 6; continue;
+        unsigned cp = (unsigned)strtol(hx, NULL, 16);
+        p += 6;
+        if (cp >= 0xD800 && cp < 0xDC00 && p[0] == '\\' && p[1] == 'u') {     // par sustituto
+          char h2[5] = { p[2], p[3], p[4], p[5], 0 };
+          unsigned lo = (unsigned)strtol(h2, NULL, 16);
+          if (lo >= 0xDC00 && lo < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); p += 6; }
+        }
+        int w = put_utf8(dst + i, max - 1 - i, cp);
+        if (!w) break;
+        i += w; continue;
       }
-      dst[i++] = p[1]; p += 2; continue;
+      char e = p[1];
+      dst[i++] = e == 'n' ? ' ' : e == 't' ? ' ' : e;
+      p += 2; continue;
     }
     dst[i++] = *p++;
   }
@@ -183,7 +206,7 @@ static int get_channels(void) {
     if (strncmp(q, "\",\"slug\":\"", 10) != 0) continue;
     const char *nm = strstr(q, "\"name\":\"");
     if (!nm || nm - q > 300) continue;
-    copy_str(nm + 8, c->name, sizeof c->name);
+    copy_json(nm + 8, c->name, sizeof c->name);
     if (c->id[0] && c->name[0]) nchans++;
   }
   free(r); return nchans > 0 ? 0 : -1;
@@ -207,7 +230,8 @@ static void nap_ms(int ms) {
 static struct {
   char variant[80];
   int url2, jwt_added, alt_audio;
-  char ts_types[48];
+  char ts_types[48], ats_types[48], alang[16];
+  int asegs, aseg_err, apl_loads, apl_err, packed;
   int segs, seg_err, pl_err, pl_loads, http, curl;
   int enc_aes, enc_other, keys, key_err, dec_fail;
   char keymethod[24];
@@ -251,53 +275,96 @@ static const char *next_line(const char *p, char *line, int cap) {
   return p;
 }
 
-// Elige la variante de mayor calidad con alto <= MAX_HEIGHT (o la mas baja si ninguna cabe)
-static int pick_variant(const char *m, const char *base, char *out, int cap) {
-  static char line[4096];
+// Lee un atributo de una etiqueta HLS (NOMBRE=valor o NOMBRE="valor")
+static int get_attr(const char *line, const char *name, char *out, int cap) {
+  int nl = strlen(name);
+  const char *p = line;
+  while ((p = strstr(p, name)) != NULL) {
+    if ((p == line || p[-1] == ',' || p[-1] == ':') && p[nl] == '=') {
+      p += nl + 1; int i = 0;
+      if (*p == '"') { p++; while (*p && *p != '"' && i < cap - 1) out[i++] = *p++; }
+      else while (*p && *p != ',' && i < cap - 1) out[i++] = *p++;
+      out[i] = 0; return 1;
+    }
+    p += nl;
+  }
+  if (cap > 0) out[0] = 0;
+  return 0;
+}
+
+// Elige la variante de mayor calidad con alto <= MAX_HEIGHT (o la mas baja si ninguna cabe).
+// Si el audio viene en una lista aparte (#EXT-X-MEDIA:TYPE=AUDIO), deja su URL en aout (prefiere espanol).
+#define MAX_MEDIA 16
+static int pick_variant(const char *m, const char *base, char *out, int cap, char *aout, int acap) {
+  static char line[4096], best[4096], low[4096], tmp[64];
+  static struct { char group[64], lang[16], uri[2048]; int def; } media[MAX_MEDIA];
+  int nmedia = 0;
+  char best_grp[64] = "", low_grp[64] = "", grp[64] = "";
   long best_bw = -1, low_bw = 0x7FFFFFFF; int best_h = 0, low_h = 0;
-  static char best[4096], low[4096];
-  best[0] = low[0] = 0;
+  best[0] = low[0] = 0; aout[0] = 0;
   long bw = 0; int h = 0, pending = 0, skip = 0, any = 0;
   const char *p = m;
   while ((p = next_line(p, line, sizeof line)) != NULL) {
-    if (!strncmp(line, "#EXT-X-MEDIA:", 13) && strstr(line, "TYPE=AUDIO") && strstr(line, "URI=")) st.alt_audio++;
-    if (!strncmp(line, "#EXT-X-STREAM-INF:", 18)) {
+    if (!strncmp(line, "#EXT-X-MEDIA:", 13)) {
+      get_attr(line, "TYPE", tmp, sizeof tmp);
+      if (!strcmp(tmp, "AUDIO") && nmedia < MAX_MEDIA && get_attr(line, "URI", media[nmedia].uri, sizeof media[0].uri)) {
+        get_attr(line, "GROUP-ID", media[nmedia].group, sizeof media[0].group);
+        get_attr(line, "LANGUAGE", media[nmedia].lang, sizeof media[0].lang);
+        get_attr(line, "DEFAULT", tmp, sizeof tmp);
+        media[nmedia].def = !strcmp(tmp, "YES");
+        nmedia++; st.alt_audio++;
+      }
+    } else if (!strncmp(line, "#EXT-X-STREAM-INF:", 18)) {
       any = 1; pending = 1; skip = 0; bw = 0; h = 0;
-      const char *b = strstr(line, "BANDWIDTH="); if (b) bw = atol(b + 10);
-      const char *r = strstr(line, "RESOLUTION="); if (r) { const char *x = strchr(r, 'x'); if (x) h = atoi(x + 1); }
-      const char *c = strstr(line, "CODECS=\""); if (c && !strstr(c, "avc1")) skip = 1;
+      if (get_attr(line, "BANDWIDTH", tmp, sizeof tmp)) bw = atol(tmp);
+      if (get_attr(line, "RESOLUTION", tmp, sizeof tmp)) { const char *x = strchr(tmp, 'x'); if (x) h = atoi(x + 1); }
+      if (get_attr(line, "CODECS", tmp, sizeof tmp) && !strstr(tmp, "avc1")) skip = 1;
+      get_attr(line, "AUDIO", grp, sizeof grp);
     } else if (pending && line[0] && line[0] != '#') {
       pending = 0;
       if (skip) continue;
       int fits = h > 0 ? h <= MAX_HEIGHT : bw <= MAX_BW_NORES;
-      if (fits && bw > best_bw) { best_bw = bw; best_h = h; snprintf(best, sizeof best, "%s", line); }
-      if (bw < low_bw) { low_bw = bw; low_h = h; snprintf(low, sizeof low, "%s", line); }
+      if (fits && bw > best_bw) { best_bw = bw; best_h = h; snprintf(best, sizeof best, "%s", line); snprintf(best_grp, sizeof best_grp, "%s", grp); }
+      if (bw < low_bw) { low_bw = bw; low_h = h; snprintf(low, sizeof low, "%s", line); snprintf(low_grp, sizeof low_grp, "%s", grp); }
     }
   }
   if (!any) { snprintf(out, cap, "%s", base); snprintf(st.variant, sizeof st.variant, "lista unica"); return 0; }
   const char *pick = best[0] ? best : low;
+  const char *g = best[0] ? best_grp : low_grp;
   if (!pick[0]) return -1;
   url_resolve(base, pick, out, cap);
   snprintf(st.variant, sizeof st.variant, "%dp  %ld kbps", best[0] ? best_h : low_h, (best[0] ? best_bw : low_bw) / 1000);
+  // audio aparte: del grupo de la variante; espanol > por defecto > el primero
+  int bi = -1, bs = -1;
+  for (int i = 0; i < nmedia; i++) {
+    if (g[0] && strcmp(media[i].group, g)) continue;
+    int sc = (!strncmp(media[i].lang, "es", 2) || !strncmp(media[i].lang, "spa", 3)) ? 3 : media[i].def ? 2 : 1;
+    if (sc > bs) { bs = sc; bi = i; }
+  }
+  if (bi >= 0) {
+    url_resolve(base, media[bi].uri, aout, acap);
+    snprintf(st.alang, sizeof st.alang, "%s", media[bi].lang[0] ? media[bi].lang : "?");
+  }
   return 0;
 }
 
-// ---- Cola de segmentos (red -> demux) ----
-typedef struct Seg { struct Seg *next; uint8_t *data; int len; int disc; } Seg;
-static Seg *sq_head, *sq_tail; static int sq_count;
+// ---- Colas de segmentos (red -> demux) ----
+typedef struct Seg { struct Seg *next; uint8_t *data; int len, epoch, reset; } Seg;
+typedef struct { Seg *head, *tail; int count; } SegQ;
+static SegQ vsq, asq;            // video (y audio si va junto) / audio aparte
 
-static void seg_push(uint8_t *d, int len, int disc) {
+static void seg_push(SegQ *q, uint8_t *d, int len, int epoch, int reset) {
   Seg *s = malloc(sizeof *s); if (!s) { free(d); return; }
-  s->next = NULL; s->data = d; s->len = len; s->disc = disc;
+  s->next = NULL; s->data = d; s->len = len; s->epoch = epoch; s->reset = reset;
   lock();
-  if (sq_tail) sq_tail->next = s; else sq_head = s;
-  sq_tail = s; sq_count++;
+  if (q->tail) q->tail->next = s; else q->head = s;
+  q->tail = s; q->count++;
   unlock();
 }
-static Seg *seg_pop(void) {
+static Seg *seg_pop(SegQ *q) {
   lock();
-  Seg *s = sq_head;
-  if (s) { sq_head = s->next; if (!sq_head) sq_tail = NULL; sq_count--; }
+  Seg *s = q->head;
+  if (s) { q->head = s->next; if (!q->head) q->tail = NULL; q->count--; }
   unlock();
   return s;
 }
@@ -305,33 +372,17 @@ static Seg *seg_pop(void) {
 // ---- Cifrado AES-128 de HLS (#EXT-X-KEY:METHOD=AES-128) ----
 // Cada segmento va cifrado con AES-128-CBC. La llave (16 bytes) se baja de la URI de la etiqueta;
 // el IV viene en la etiqueta o, si no, es el numero de secuencia del segmento.
-static char key_uri[4096];
-static uint8_t key_val[16];
-static int key_ok;
-
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
-static int get_key(const char *uri) {
-  if (key_ok && !strcmp(uri, key_uri)) return 0;
-  int n = 0;
-  char *k = http_get(uri, &n);
-  st.http = g_status; st.curl = g_err;
-  if (!k || n != 16) { free(k); st.key_err++; key_ok = 0; return -1; }
-  memcpy(key_val, k, 16); free(k);
-  snprintf(key_uri, sizeof key_uri, "%s", uri);
-  key_ok = 1; st.keys++;
-  return 0;
-}
-
 // Descifra en un bufer nuevo; devuelve el largo o -1
-static int aes_decrypt(const uint8_t *in, int len, const uint8_t *iv, uint8_t **out) {
+static int aes_decrypt(const uint8_t *key, const uint8_t *in, int len, const uint8_t *iv, uint8_t **out) {
   *out = NULL;
   if (len <= 0 || len % 16) return -1;
   uint8_t *o = malloc(len + 16);
   if (!o) return -1;
   EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
   if (!c) { free(o); return -1; }
-  int n1 = 0, n2 = 0, ok = EVP_DecryptInit_ex(c, EVP_aes_128_cbc(), NULL, key_val, iv) == 1 &&
+  int n1 = 0, n2 = 0, ok = EVP_DecryptInit_ex(c, EVP_aes_128_cbc(), NULL, key, iv) == 1 &&
                            EVP_DecryptUpdate(c, o, &n1, in, len) == 1;
   if (ok && EVP_DecryptFinal_ex(c, o + n1, &n2) != 1) n2 = 0;   // relleno raro: se queda con lo descifrado
   EVP_CIPHER_CTX_free(c);
@@ -340,42 +391,58 @@ static int aes_decrypt(const uint8_t *in, int len, const uint8_t *iv, uint8_t **
   return n1 + n2;
 }
 
-// ---- Hilo de red: recarga la lista y baja segmentos ----
-static char g_media_url[4096];
-
+// ---- Hilos de red: recargan su lista y bajan segmentos ----
+// Hay uno para el video y, si el canal trae el audio en otra lista, otro para el audio.
 #define MAX_SEGS 256
-typedef struct { char *uri; char *key; int disc, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
+typedef struct { char *uri; char *key; int epoch, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
+typedef struct {
+  char url[4096];
+  SegQ *q;
+  int is_audio;
+  char key_uri[4096]; uint8_t key_val[16]; int key_ok;
+  char line[4096], cur_key[4096], raw[4096];
+  SegInfo segs[MAX_SEGS];
+} NetCtx;
+static NetCtx *vnet, *anet;
 
-static int net_thread(SceSize a, void *u) {
-  static char line[4096], cur_key[4096];
-  static SegInfo segs[MAX_SEGS];
+static int get_key(NetCtx *c, const char *uri) {
+  if (c->key_ok && !strcmp(uri, c->key_uri)) return 0;
+  int n = 0;
+  char *k = http_get(uri, &n);
+  st.http = g_status; st.curl = g_err;
+  if (!k || n != 16) { free(k); st.key_err++; c->key_ok = 0; return -1; }
+  memcpy(c->key_val, k, 16); free(k);
+  snprintf(c->key_uri, sizeof c->key_uri, "%s", uri);
+  c->key_ok = 1; st.keys++;
+  return 0;
+}
+
+static int net_thread(SceSize a, void *argp) {
+  NetCtx *c = *(NetCtx **)argp;
   int64_t next_seq = -1;
-  int pending_disc = 0;
+  int pending_reset = 0;
   while (playing) {
     int len = 0;
-    char *pl = http_get(g_media_url, &len);
+    char *pl = http_get(c->url, &len);
     st.http = g_status; st.curl = g_err;
-    if (!pl) { st.pl_err++; nap_ms(2000); continue; }
-    st.pl_loads++;
-    int64_t mseq = 0; int tdur = 6, n = 0, ended = 0, disc = 0;
-    int method = 0, has_iv = 0; uint8_t iv[16]; cur_key[0] = 0;
+    if (!pl) { if (c->is_audio) st.apl_err++; else st.pl_err++; nap_ms(2000); continue; }
+    if (c->is_audio) st.apl_loads++; else st.pl_loads++;
+    int64_t mseq = 0, dseq = 0; int tdur = 6, n = 0, ended = 0, dcount = 0;
+    int method = 0, has_iv = 0; uint8_t iv[16]; c->cur_key[0] = 0;
+    memset(iv, 0, 16);
     const char *p = pl;
-    while ((p = next_line(p, line, sizeof line)) != NULL) {
+    while ((p = next_line(p, c->line, sizeof c->line)) != NULL) {
+      const char *line = c->line;
       if (!strncmp(line, "#EXT-X-MEDIA-SEQUENCE:", 22)) mseq = atoll(line + 22);
+      else if (!strncmp(line, "#EXT-X-DISCONTINUITY-SEQUENCE:", 30)) dseq = atoll(line + 30);
       else if (!strncmp(line, "#EXT-X-TARGETDURATION:", 22)) tdur = atoi(line + 22);
-      else if (!strncmp(line, "#EXT-X-DISCONTINUITY", 20) && line[20] != '-') disc = 1;
+      else if (!strncmp(line, "#EXT-X-DISCONTINUITY", 20) && line[20] != '-') dcount++;
       else if (!strncmp(line, "#EXT-X-ENDLIST", 14)) ended = 1;
       else if (!strncmp(line, "#EXT-X-KEY:", 11)) {
         method = strstr(line, "METHOD=NONE") ? 0 : strstr(line, "METHOD=AES-128") ? 1 : 2;
         if (method == 2) { const char *m = strstr(line, "METHOD="); snprintf(st.keymethod, sizeof st.keymethod, "%.20s", m ? m + 7 : "?"); }
-        cur_key[0] = 0; has_iv = 0;
-        const char *ur = strstr(line, "URI=\"");
-        if (ur) {
-          char raw[4096]; int i = 0; ur += 5;
-          while (*ur && *ur != '"' && i < (int)sizeof raw - 1) raw[i++] = *ur++;
-          raw[i] = 0;
-          url_resolve(g_media_url, raw, cur_key, sizeof cur_key);
-        }
+        c->cur_key[0] = 0; has_iv = 0;
+        if (get_attr(line, "URI", c->raw, sizeof c->raw)) url_resolve(c->url, c->raw, c->cur_key, sizeof c->cur_key);
         const char *ivp = strstr(line, "IV=0x"); if (!ivp) ivp = strstr(line, "IV=0X");
         if (ivp) {
           ivp += 5; memset(iv, 0, 16);
@@ -390,51 +457,52 @@ static int net_thread(SceSize a, void *u) {
       }
       else if (line[0] && line[0] != '#') {
         if (n < MAX_SEGS) {
-          SegInfo *si = &segs[n];
+          SegInfo *si = &c->segs[n];
           si->uri = malloc(4096);
           if (si->uri) {
-            url_resolve(g_media_url, line, si->uri, 4096);
-            si->disc = disc; si->method = method; si->has_iv = has_iv;
+            url_resolve(c->url, line, si->uri, 4096);
+            si->epoch = (int)(dseq + dcount);   // igual en la lista de video y la de audio
+            si->method = method; si->has_iv = has_iv;
             memcpy(si->iv, iv, 16);
-            si->key = method == 1 && cur_key[0] ? strdup(cur_key) : NULL;
+            si->key = method == 1 && c->cur_key[0] ? strdup(c->cur_key) : NULL;
             n++;
           }
         }
-        disc = 0;
       }
     }
     free(pl);
     if (tdur < 1) tdur = 1;
     if (next_seq < 0 || next_seq > mseq + n + 10) next_seq = mseq + (n > 3 ? n - 3 : 0);
-    if (next_seq < mseq) { next_seq = mseq; pending_disc = 1; }   // nos quedamos atras
+    if (next_seq < mseq) { next_seq = mseq; pending_reset = 1; }   // nos quedamos atras
     int got = 0;
     for (int i = 0; i < n && playing; i++) {
       int64_t seq = mseq + i;
       if (seq < next_seq) continue;
-      while (playing && sq_count >= SEG_AHEAD) nap_ms(20);
+      while (playing && c->q->count >= SEG_AHEAD) nap_ms(20);
       if (!playing) break;
-      SegInfo *si = &segs[i];
+      SegInfo *si = &c->segs[i];
       next_seq = seq + 1;
-      if (si->method == 2) { st.enc_other++; pending_disc = 1; continue; }   // cifrado que no se puede abrir (DRM)
+      if (si->method == 2) { st.enc_other++; pending_reset = 1; continue; }   // cifrado que no se puede abrir (DRM)
       int sl = 0;
       char *d = http_get(si->uri, &sl);
       st.http = g_status; st.curl = g_err;
-      if (!d) { st.seg_err++; pending_disc = 1; continue; }
+      if (!d) { if (c->is_audio) st.aseg_err++; else st.seg_err++; pending_reset = 1; continue; }
       if (si->method == 1) {
         st.enc_aes++;
         uint8_t ivb[16], *plain = NULL;
         if (si->has_iv) memcpy(ivb, si->iv, 16);
         else { memset(ivb, 0, 16); for (int k = 0; k < 8; k++) ivb[15 - k] = (uint8_t)((uint64_t)seq >> (8 * k)); }
-        int pn = (si->key && get_key(si->key) == 0) ? aes_decrypt((uint8_t *)d, sl, ivb, &plain) : -1;
+        int pn = (si->key && get_key(c, si->key) == 0) ? aes_decrypt(c->key_val, (uint8_t *)d, sl, ivb, &plain) : -1;
         free(d);
-        if (pn < 0) { st.dec_fail++; pending_disc = 1; continue; }
+        if (pn < 0) { st.dec_fail++; pending_reset = 1; continue; }
         d = (char *)plain; sl = pn;
       }
-      seg_push((uint8_t *)d, sl, si->disc || pending_disc);
-      pending_disc = 0; got = 1; st.segs++;
+      seg_push(c->q, (uint8_t *)d, sl, si->epoch, pending_reset);
+      pending_reset = 0; got = 1;
+      if (c->is_audio) st.asegs++; else st.segs++;
     }
-    for (int i = 0; i < n; i++) { free(segs[i].uri); free(segs[i].key); segs[i].uri = segs[i].key = NULL; }
-    if (ended && !got) { snprintf(st.msg, sizeof st.msg, "Fin de la transmision"); break; }
+    for (int i = 0; i < n; i++) { free(c->segs[i].uri); free(c->segs[i].key); c->segs[i].uri = c->segs[i].key = NULL; }
+    if (ended && !got) { if (!c->is_audio) snprintf(st.msg, sizeof st.msg, "Fin de la transmision"); break; }
     if (!got) nap_ms(tdur * 500);
   }
   return 0;
@@ -808,10 +876,15 @@ static void audio_frame(const uint8_t *d, int len, int64_t pts, int epoch) {
   st.aframes++;
 }
 
-// ---- Demultiplexor MPEG-TS ----
+// ---- Demultiplexor MPEG-TS (uno por lista) ----
 typedef struct { uint8_t *buf; int len, cap, want, started; int64_t pts; } Pes;
-static int pmt_pid, vpid, apid, epoch;
-static Pes vpes, apes;
+typedef struct {
+  SegQ *q;
+  int pmt_pid, vpid, apid, epoch, use_audio;
+  Pes vpes, apes;
+  char *types;                   // tipos de pista vistos (para la pantalla de datos)
+} Dmx;
+static Dmx vdmx, admx;
 
 static int64_t read_pts(const uint8_t *p) {
   return ((int64_t)((p[0] >> 1) & 7) << 30) | ((int64_t)p[1] << 22) | ((int64_t)(p[2] >> 1) << 15) |
@@ -830,23 +903,26 @@ static void pes_append(Pes *p, const uint8_t *d, int n) {
   memcpy(p->buf + p->len, d, n); p->len += n;
 }
 
-static void pes_flush(Pes *p, int is_video) {
+// Recorre cuadros ADTS seguidos; el primero tiene pts0 y los demas avanzan 1024 muestras
+static void adts_run(const uint8_t *buf, int len, int64_t pts0, int epoch) {
+  int i = 0, k = 0;
+  while (i + 7 <= len && playing) {
+    const uint8_t *d = buf + i;
+    if (d[0] != 0xFF || (d[1] & 0xF6) != 0xF0) { i++; continue; }
+    int fl = ((d[3] & 3) << 11) | (d[4] << 3) | (d[5] >> 5);
+    if (fl < 7 || i + fl > len) break;
+    int sfi = (d[2] >> 2) & 15;
+    int rate = sfi < 13 ? ADTS_RATES[sfi] : 48000;
+    int64_t pts = pts0 >= 0 ? pts0 + (int64_t)k * 1024 * 90000 / rate : -1;
+    audio_frame(d, fl, pts, epoch);
+    i += fl; k++;
+  }
+}
+
+static void pes_flush(Dmx *x, Pes *p, int is_video) {
   if (p->started && p->len > 0) {
-    if (is_video) vq_push(p->buf, p->len, p->pts, epoch);
-    else {
-      int i = 0, k = 0;
-      while (i + 7 <= p->len && playing) {
-        const uint8_t *d = p->buf + i;
-        if (d[0] != 0xFF || (d[1] & 0xF6) != 0xF0) { i++; continue; }
-        int fl = ((d[3] & 3) << 11) | (d[4] << 3) | (d[5] >> 5);
-        if (fl < 7 || i + fl > p->len) break;
-        int sfi = (d[2] >> 2) & 15;
-        int rate = sfi < 13 ? ADTS_RATES[sfi] : 48000;
-        int64_t pts = p->pts >= 0 ? p->pts + (int64_t)k * 1024 * 90000 / rate : -1;
-        audio_frame(d, fl, pts, epoch);
-        i += fl; k++;
-      }
-    }
+    if (is_video) vq_push(p->buf, p->len, p->pts, x->epoch);
+    else adts_run(p->buf, p->len, p->pts, x->epoch);
   }
   p->len = 0; p->started = 0; p->want = 0; p->pts = -1;
 }
@@ -861,9 +937,9 @@ static void pes_start(Pes *p, const uint8_t *d, int n) {
   pes_append(p, d + 9 + hl, n - 9 - hl);
 }
 
-static void ts_reset(void) { pmt_pid = vpid = apid = -1; }
+static void ts_reset(Dmx *x) { x->pmt_pid = x->vpid = x->apid = -1; }
 
-static void ts_packet(const uint8_t *p) {
+static void ts_packet(Dmx *x, const uint8_t *p) {
   int pid = ((p[1] & 0x1F) << 8) | p[2], pusi = p[1] & 0x40, afc = (p[3] >> 4) & 3;
   int o = 4;
   if (afc & 2) o += 1 + p[4];
@@ -875,9 +951,9 @@ static void ts_packet(const uint8_t *p) {
     int sl = ((d[1] & 0x0F) << 8) | d[2];
     for (int i = 8; i + 4 <= 3 + sl - 4 && i + 4 <= n; i += 4) {
       int prog = (d[i] << 8) | d[i + 1];
-      if (prog != 0) { pmt_pid = ((d[i + 2] & 0x1F) << 8) | d[i + 3]; break; }
+      if (prog != 0) { x->pmt_pid = ((d[i + 2] & 0x1F) << 8) | d[i + 3]; break; }
     }
-  } else if (pid == pmt_pid && pusi) {                      // PMT
+  } else if (pid == x->pmt_pid && pusi) {                   // PMT
     int ptr = d[0]; d += 1 + ptr; n -= 1 + ptr;
     if (n < 12 || d[0] != 2) return;
     int sl = ((d[1] & 0x0F) << 8) | d[2];
@@ -892,30 +968,68 @@ static void ts_packet(const uint8_t *p) {
       if (tl < (int)sizeof types - 4) tl += snprintf(types + tl, sizeof types - tl, "%02X ", type);
       i += 5 + il;
     }
-    vpid = nv; apid = na;
+    x->vpid = nv; x->apid = x->use_audio ? na : -1;
     types[tl] = 0;
-    if (strcmp(types, st.ts_types)) snprintf(st.ts_types, sizeof st.ts_types, "%s", types);
-  } else if (pid == vpid || pid == apid) {
-    Pes *pe = pid == vpid ? &vpes : &apes;
-    if (pusi) { pes_flush(pe, pid == vpid); pes_start(pe, d, n); }
+    if (x->types && strcmp(types, x->types)) snprintf(x->types, 48, "%s", types);
+  } else if (pid == x->vpid || pid == x->apid) {
+    int vid = pid == x->vpid;
+    Pes *pe = vid ? &x->vpes : &x->apes;
+    if (pusi) { pes_flush(x, pe, vid); pes_start(pe, d, n); }
     else if (pe->started) pes_append(pe, d, n);
-    if (pe->started && pe->want > 0 && pe->len >= pe->want) pes_flush(pe, pid == vpid);
+    if (pe->started && pe->want > 0 && pe->len >= pe->want) pes_flush(x, pe, vid);
   }
 }
 
-static int demux_thread(SceSize a, void *u) {
-  ts_reset(); epoch = 0;
-  vpes.pts = apes.pts = -1;
-  while (playing) {
-    Seg *s = seg_pop();
-    if (!s) { sceKernelDelayThread(5000); continue; }
-    if (s->disc) { pes_flush(&vpes, 1); pes_flush(&apes, 0); ts_reset(); epoch++; }
-    const uint8_t *d = s->data;
-    int i = 0;
-    while (i + 188 <= s->len && playing) {
-      if (d[i] != 0x47) { i++; continue; }
-      ts_packet(d + i); i += 188;
+// Audio empaquetado (.aac): etiqueta ID3 con la marca de tiempo y luego cuadros ADTS
+static int64_t id3_pts(const uint8_t *d, int len, int *hdr) {
+  static const char own[] = "com.apple.streaming.transportStreamTimestamp";   // incluye el 0 final
+  int64_t pts = -1;
+  *hdr = 0;
+  while (len - *hdr >= 10 && !memcmp(d + *hdr, "ID3", 3)) {
+    const uint8_t *t = d + *hdr;
+    int sz = ((t[6] & 0x7F) << 21) | ((t[7] & 0x7F) << 14) | ((t[8] & 0x7F) << 7) | (t[9] & 0x7F);
+    int total = 10 + sz + ((t[5] & 0x10) ? 10 : 0);
+    for (int i = 10; i + (int)sizeof own + 8 <= total && *hdr + i + (int)sizeof own + 8 <= len; i++) {
+      if (!memcmp(t + i, own, sizeof own)) {
+        const uint8_t *b = t + i + sizeof own;
+        pts = ((int64_t)(b[3] & 1) << 32) | ((int64_t)b[4] << 24) | ((int64_t)b[5] << 16) | ((int64_t)b[6] << 8) | b[7];
+        break;
+      }
     }
+    *hdr += total;
+  }
+  if (*hdr > len) *hdr = len;
+  return pts;
+}
+
+static void dmx_segment(Dmx *x, Seg *s) {
+  if (s->reset || s->epoch != x->epoch) {
+    pes_flush(x, &x->vpes, 1); pes_flush(x, &x->apes, 0);
+    ts_reset(x); x->epoch = s->epoch;
+  }
+  const uint8_t *d = s->data;
+  if (s->len >= 3 && !memcmp(d, "ID3", 3)) {                  // audio empaquetado
+    if (!x->use_audio) return;
+    int h; int64_t pts = id3_pts(d, s->len, &h);
+    st.packed++;
+    adts_run(d + h, s->len - h, pts, x->epoch);
+    return;
+  }
+  int i = 0;
+  while (i + 188 <= s->len && playing) {
+    if (d[i] != 0x47) { i++; continue; }
+    ts_packet(x, d + i); i += 188;
+  }
+}
+
+static int demux_thread(SceSize a, void *argp) {
+  Dmx *x = *(Dmx **)argp;
+  ts_reset(x); x->epoch = -1;
+  x->vpes.pts = x->apes.pts = -1;
+  while (playing) {
+    Seg *s = seg_pop(x->q);
+    if (!s) { sceKernelDelayThread(5000); continue; }
+    dmx_segment(x, s);
     free(s->data); free(s);
   }
   return 0;
@@ -1021,7 +1135,7 @@ static void draw_debug(int y0) {
            st.jwt_added ? "  +jwt" : "", st.alt_audio);
   vita2d_pgf_draw_text(pgf, 20, y0, col, 0.9f, l);
   snprintf(l, sizeof l, "Red: segmentos %d  errores %d  lista %d/%d  http %d  curl %d  cola %d",
-           st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, sq_count);
+           st.segs, st.seg_err, st.pl_loads, st.pl_err, st.http, st.curl, vsq.count);
   vita2d_pgf_draw_text(pgf, 20, y0 + 26, col, 0.9f, l);
   if (st.enc_aes || st.enc_other) {
     snprintf(l, sizeof l, "Cifrado: AES-128 %d  llaves %d  err llave %d  err descifrar %d  otro %d %s",
@@ -1037,13 +1151,17 @@ static void draw_debug(int y0) {
   snprintf(l, sizeof l, "Audio: %d Hz %d ch  cuadros %d  tarde %d  err %d (0x%08X)  cola %d  TS: %s",
            st.arate, st.ach, st.aframes, st.alate, st.aerr, st.last_aerr, pcm_count, st.ts_types);
   vita2d_pgf_draw_text(pgf, 20, y0 + 104, col, 0.9f, l);
+  if (anet) {
+    snprintf(l, sizeof l, "Audio aparte (%s): segmentos %d  errores %d  lista %d/%d  aac %d  TS: %s",
+             st.alang, st.asegs, st.aseg_err, st.apl_loads, st.apl_err, st.packed, st.ats_types);
+    vita2d_pgf_draw_text(pgf, 20, y0 + 182, RGBA8(120,255,160,255), 0.9f, l);
+  }
   if (st.msg[0]) vita2d_pgf_draw_text(pgf, 20, y0 + 130, RGBA8(255,120,120,255), 0.9f, st.msg);
 }
 
 static void play_channel(const Channel *c) {
   static char url[4096];
   memset(&st, 0, sizeof st);
-  key_ok = 0; key_uri[0] = 0;
   int use2 = stitcher[0] && sparams[0];
   if (use2) snprintf(url, sizeof url, STITCH_URL2, stitcher, c->id, sparams, jwt);
   else snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
@@ -1053,19 +1171,35 @@ static void play_channel(const Channel *c) {
     char m[200]; snprintf(m, sizeof m, "No se pudo abrir el canal: curl %d  http %d", g_err, g_status);
     status(m); sceKernelDelayThread(4000000); return;
   }
-  int pv = pick_variant(master, url, g_media_url, sizeof g_media_url);
+  vnet = calloc(1, sizeof(NetCtx));
+  anet = calloc(1, sizeof(NetCtx));
+  if (!vnet || !anet) { free(master); free(vnet); free(anet); vnet = anet = NULL; status("Sin memoria"); sceKernelDelayThread(3000000); return; }
+  int pv = pick_variant(master, url, vnet->url, sizeof vnet->url, anet->url, sizeof anet->url);
   free(master);
-  if (pv == 0 && !strstr(g_media_url, "jwt=")) {   // la lista de calidad tambien pide el token
-    int n = strlen(g_media_url);
-    snprintf(g_media_url + n, sizeof g_media_url - n, "%cjwt=%s", strchr(g_media_url, '?') ? '&' : '?', jwt);
+  st.url2 = use2;
+  if (pv < 0) {
+    free(vnet); free(anet); vnet = anet = NULL;
+    status("La lista del canal no tiene video H.264"); sceKernelDelayThread(4000000); return;
+  }
+  // las listas de calidad y de audio tambien piden el token
+  NetCtx *nc[2] = { vnet, anet };
+  for (int k = 0; k < 2; k++) {
+    char *u = nc[k]->url;
+    if (!u[0] || strstr(u, "jwt=")) continue;
+    int n = strlen(u);
+    snprintf(u + n, sizeof nc[k]->url - n, "%cjwt=%s", strchr(u, '?') ? '&' : '?', jwt);
     st.jwt_added = 1;
   }
-  st.url2 = use2;
-  if (pv < 0) { status("La lista del canal no tiene video H.264"); sceKernelDelayThread(4000000); return; }
+  if (!anet->url[0]) { free(anet); anet = NULL; }
+  vnet->q = &vsq; vnet->is_audio = 0;
+  if (anet) { anet->q = &asq; anet->is_audio = 1; }
 
   // estado inicial
   mtx = sceKernelCreateMutex("pv_mtx", 0, 0, NULL);
-  sq_head = sq_tail = NULL; sq_count = 0;
+  memset(&vsq, 0, sizeof vsq); memset(&asq, 0, sizeof asq);
+  memset(&vdmx, 0, sizeof vdmx); memset(&admx, 0, sizeof admx);
+  vdmx.q = &vsq; vdmx.types = st.ts_types; vdmx.use_audio = anet == NULL;
+  admx.q = &asq; admx.types = st.ats_types; admx.use_audio = 1;
   vq_head = vq_tail = NULL; vq_count = 0;
   pcm_ring = malloc(sizeof(Pcm) * PCM_SLOTS);
   pcm_rd = pcm_wr = pcm_count = 0;
@@ -1073,18 +1207,25 @@ static void play_channel(const Channel *c) {
   memset(slots, 0, sizeof slots);
   for (int i = 0; i < NSLOTS; i++) slots[i].uid = -1;
   shown = -1; out_seq = 0; vreset_req = vreset_ack = 0;
-  memset(&vpes, 0, sizeof vpes); memset(&apes, 0, sizeof apes);
-  if (!pcm_ring) { status("Sin memoria"); sceKernelDelayThread(3000000); sceKernelDeleteMutex(mtx); return; }
+  if (!pcm_ring) { status("Sin memoria"); sceKernelDelayThread(3000000); sceKernelDeleteMutex(mtx); free(vnet); free(anet); vnet = anet = NULL; return; }
 
   playing = 1; g_abort = 0;
-  SceUID th_net = sceKernelCreateThread("pv_net",   net_thread,   0x10000100, 512 * 1024, 0, 0, NULL);
+  SceUID th_net = sceKernelCreateThread("pv_net",   net_thread,   0x10000100, 256 * 1024, 0, 0, NULL);
   SceUID th_dmx = sceKernelCreateThread("pv_demux", demux_thread, 0x10000100, 128 * 1024, 0, 0, NULL);
   SceUID th_vid = sceKernelCreateThread("pv_video", vdec_thread,  0x10000100, 64 * 1024,  0, 0, NULL);
   SceUID th_aud = sceKernelCreateThread("pv_audio", audio_thread, 0x10000100, 64 * 1024,  0, 0, NULL);
-  sceKernelStartThread(th_net, 0, NULL);
-  sceKernelStartThread(th_dmx, 0, NULL);
+  SceUID th_anet = -1, th_admx = -1;
+  void *arg;
+  arg = vnet;  sceKernelStartThread(th_net, sizeof arg, &arg);
+  arg = &vdmx; sceKernelStartThread(th_dmx, sizeof arg, &arg);
   sceKernelStartThread(th_vid, 0, NULL);
   sceKernelStartThread(th_aud, 0, NULL);
+  if (anet) {                        // audio en lista aparte: su propia red y su propio demux
+    th_anet = sceKernelCreateThread("pv_anet", net_thread,   0x10000100, 256 * 1024, 0, 0, NULL);
+    th_admx = sceKernelCreateThread("pv_admx", demux_thread, 0x10000100, 128 * 1024, 0, 0, NULL);
+    arg = anet;  sceKernelStartThread(th_anet, sizeof arg, &arg);
+    arg = &admx; sceKernelStartThread(th_admx, sizeof arg, &arg);
+  }
 
   int show_dbg = 0;
   while (playing) {
@@ -1104,8 +1245,8 @@ static void play_channel(const Channel *c) {
       vita2d_pgf_draw_text(pgf, 20, 60, RGBA8(255,255,255,255), 1.2f, "Buffering...  (O = volver)");
     }
     if (show_dbg || sh < 0) {
-      if (sh >= 0) vita2d_draw_rectangle(0, 330, 960, 214, RGBA8(0,0,0,170));
-      draw_debug(sh >= 0 ? 360 : 110);
+      if (sh >= 0) vita2d_draw_rectangle(0, 310, 960, 234, RGBA8(0,0,0,170));
+      draw_debug(sh >= 0 ? 336 : 110);
     }
     vita2d_end_drawing();
     vita2d_wait_rendering_done();       // la GPU termino: ya se pueden reciclar los cuadros
@@ -1120,17 +1261,114 @@ static void play_channel(const Channel *c) {
   sceKernelWaitThreadEnd(th_aud, NULL, NULL);
   sceKernelDeleteThread(th_net); sceKernelDeleteThread(th_dmx);
   sceKernelDeleteThread(th_vid); sceKernelDeleteThread(th_aud);
+  if (th_anet >= 0) { sceKernelWaitThreadEnd(th_anet, NULL, NULL); sceKernelDeleteThread(th_anet); }
+  if (th_admx >= 0) { sceKernelWaitThreadEnd(th_admx, NULL, NULL); sceKernelDeleteThread(th_admx); }
   g_abort = 0;
 
   vita2d_wait_rendering_done();
   vdec_close();
   adec_close();
-  Seg *s; while ((s = seg_pop()) != NULL) { free(s->data); free(s); }
+  Seg *s;
+  while ((s = seg_pop(&vsq)) != NULL) { free(s->data); free(s); }
+  while ((s = seg_pop(&asq)) != NULL) { free(s->data); free(s); }
   VAu *v; while ((v = vq_pop()) != NULL) { free(v->data); free(v); }
-  free(vpes.buf); free(apes.buf); memset(&vpes, 0, sizeof vpes); memset(&apes, 0, sizeof apes);
+  free(vdmx.vpes.buf); free(vdmx.apes.buf); free(admx.vpes.buf); free(admx.apes.buf);
+  memset(&vdmx, 0, sizeof vdmx); memset(&admx, 0, sizeof admx);
+  free(vnet); free(anet); vnet = anet = NULL;
   free(pcm_ring); pcm_ring = NULL;
   sceKernelDeleteMutex(mtx); mtx = -1;
   use_pts = 1; pts_tried = 0;
+}
+
+// ---------- Buscador ----------
+static int view[MAX_CH], nview;   // canales que coinciden con la busqueda
+static char query[128];
+
+// minusculas y sin acentos, para comparar ("Accion" encuentra "Acción")
+static void fold(const char *s, char *o, int cap) {
+  int i = 0;
+  const unsigned char *u = (const unsigned char *)s;
+  while (*u && i < cap - 1) {
+    unsigned c = *u;
+    if (c == 0xC3 && u[1]) {
+      unsigned d = u[1] | 0x20;                 // 0x80-0x9F mayusculas -> 0xA0-0xBF
+      char r = 0;
+      if (d >= 0xA0 && d <= 0xA5) r = 'a'; else if (d == 0xA7) r = 'c';
+      else if (d >= 0xA8 && d <= 0xAB) r = 'e'; else if (d >= 0xAC && d <= 0xAF) r = 'i';
+      else if (d == 0xB1) r = 'n'; else if (d >= 0xB2 && d <= 0xB6) r = 'o';
+      else if (d >= 0xB9 && d <= 0xBC) r = 'u';
+      if (r) { o[i++] = r; u += 2; continue; }
+    }
+    o[i++] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    u++;
+  }
+  o[i] = 0;
+}
+
+static void build_view(void) {
+  char q[128], n[128];
+  fold(query, q, sizeof q);
+  nview = 0;
+  for (int i = 0; i < nchans; i++) {
+    if (q[0]) { fold(chans[i].name, n, sizeof n); if (!strstr(n, q)) continue; }
+    view[nview++] = i;
+  }
+}
+
+static void utf8_to_utf16(const char *s, SceWChar16 *o, int cap) {
+  int i = 0;
+  const unsigned char *u = (const unsigned char *)s;
+  while (*u && i < cap - 1) {
+    unsigned cp;
+    if (*u < 0x80) cp = *u++;
+    else if ((*u & 0xE0) == 0xC0 && u[1]) { cp = ((u[0] & 0x1F) << 6) | (u[1] & 0x3F); u += 2; }
+    else if ((*u & 0xF0) == 0xE0 && u[1] && u[2]) { cp = ((u[0] & 0x0F) << 12) | ((u[1] & 0x3F) << 6) | (u[2] & 0x3F); u += 3; }
+    else { u++; continue; }
+    o[i++] = (SceWChar16)cp;
+  }
+  o[i] = 0;
+}
+
+static void utf16_to_utf8(const SceWChar16 *s, char *o, int cap) {
+  int i = 0;
+  for (; *s; s++) { int w = put_utf8(o + i, cap - 1 - i, *s); if (!w) break; i += w; }
+  o[i] = 0;
+}
+
+// Abre el teclado de la Vita; devuelve 1 si el usuario confirmo
+static int ime_search(void) {
+  static SceWChar16 title[32], init[128], buf[128];
+  utf8_to_utf16("Buscar canal", title, 32);
+  utf8_to_utf16(query, init, 128);
+  memset(buf, 0, sizeof buf);
+  SceImeDialogParam ip;
+  sceImeDialogParamInit(&ip);
+  ip.supportedLanguages = SCE_IME_LANGUAGE_SPANISH | SCE_IME_LANGUAGE_ENGLISH;
+  ip.languagesForced = SCE_FALSE;
+  ip.type = SCE_IME_TYPE_DEFAULT;
+  ip.option = 0;
+  ip.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_WITH_CLEAR;
+  ip.title = title;
+  ip.maxTextLength = 60;
+  ip.initialText = init;
+  ip.inputTextBuffer = buf;
+  if (sceImeDialogInit(&ip) < 0) return 0;
+  int ok = 0;
+  for (;;) {
+    vita2d_start_drawing(); vita2d_clear_screen(); vita2d_end_drawing();
+    vita2d_common_dialog_update();
+    vita2d_swap_buffers();
+    if (sceImeDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_FINISHED) {
+      SceImeDialogResult r; memset(&r, 0, sizeof r);
+      sceImeDialogGetResult(&r);
+      ok = r.button == SCE_IME_DIALOG_BUTTON_ENTER;
+      sceImeDialogTerm();
+      break;
+    }
+  }
+  if (ok) utf16_to_utf8(buf, query, sizeof query);
+  sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;   // que la X del teclado no abra un canal
+  return ok;
 }
 
 // ---------- Main ----------
@@ -1140,6 +1378,11 @@ int main(void) {
   SceNetInitParam np = { netmem, sizeof netmem, 0 };
   sceNetInit(&np); sceNetCtlInit();
   curl_global_init(CURL_GLOBAL_DEFAULT);
+  {
+    SceAppUtilInitParam aip; SceAppUtilBootParam abp;
+    memset(&aip, 0, sizeof aip); memset(&abp, 0, sizeof abp);
+    sceAppUtilInit(&aip, &abp);                 // necesario para el teclado (dialogo comun)
+  }
 
   vita2d_init(); pgf = vita2d_load_default_pgf();
   sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
@@ -1154,29 +1397,39 @@ int main(void) {
     char m[200]; snprintf(m, sizeof m, "Error canales: paso %d  codigo 0x%08X  http %d", g_step, (unsigned)g_err, g_status);
     status(m); sceKernelDelayThread(15000000); goto out; }
 
-  int sel = 0, top = 0; const int rows = 15;
+  query[0] = 0; build_view();
+  int sel = 0, top = 0; const int rows = 14;
   for (;;) {
     sceCtrlPeekBufferPositive(0, &pad, 1);
     unsigned p = pad.buttons & ~oldpad.buttons; oldpad = pad;
-    if ((p & SCE_CTRL_DOWN) && sel < nchans - 1) sel++;
+    if ((p & SCE_CTRL_DOWN) && sel < nview - 1) sel++;
     if ((p & SCE_CTRL_UP) && sel > 0) sel--;
-    if (p & SCE_CTRL_RTRIGGER) sel = sel + rows < nchans ? sel + rows : nchans - 1;
+    if (p & SCE_CTRL_RTRIGGER) sel = sel + rows < nview ? sel + rows : nview - 1;
     if (p & SCE_CTRL_LTRIGGER) sel = sel - rows > 0 ? sel - rows : 0;
+    if (sel < 0) sel = 0;
     if (sel < top) top = sel;
     if (sel >= top + rows) top = sel - rows + 1;
-    if (p & SCE_CTRL_CROSS) { play_channel(&chans[sel]); continue; }
+    if ((p & SCE_CTRL_CROSS) && nview > 0) { play_channel(&chans[view[sel]]); continue; }
+    if (p & SCE_CTRL_TRIANGLE) { if (ime_search()) { build_view(); sel = top = 0; } continue; }
+    if ((p & SCE_CTRL_SQUARE) && query[0]) { query[0] = 0; build_view(); sel = top = 0; }
     if (p & SCE_CTRL_START) break;
 
     vita2d_start_drawing(); vita2d_clear_screen();
     vita2d_draw_rectangle(0, 0, 960, 50, RGBA8(30,30,120,255));
     vita2d_pgf_draw_text(pgf, 20, 34, RGBA8(255,255,255,255), 1.3f, "Pluto TV para Vita");
-    for (int i = 0; i < rows && top + i < nchans; i++) {
+    if (query[0]) {
+      char hdr[200]; snprintf(hdr, sizeof hdr, "Buscar: %s  (%d)", query, nview);
+      vita2d_pgf_draw_text(pgf, 420, 34, RGBA8(255,230,120,255), 1.0f, hdr);
+    }
+    for (int i = 0; i < rows && top + i < nview; i++) {
       int y = 70 + i * 31, idx = top + i;
       if (idx == sel) vita2d_draw_rectangle(10, y - 4, 940, 30, RGBA8(70,70,200,255));
-      vita2d_pgf_draw_text(pgf, 24, y + 18, RGBA8(255,255,255,255), 1.0f, chans[idx].name);
+      vita2d_pgf_draw_text(pgf, 24, y + 18, RGBA8(255,255,255,255), 1.0f, chans[view[idx]].name);
     }
+    if (nview == 0) vita2d_pgf_draw_text(pgf, 24, 100, RGBA8(255,200,200,255), 1.0f, "Sin resultados. CUADRADO: ver todos");
     vita2d_pgf_draw_text(pgf, 20, 535, RGBA8(180,180,180,255), 0.9f,
-                         "X: ver   O: volver   L/R: pagina   START: salir");
+                         query[0] ? "X: ver   TRIANGULO: buscar   CUADRADO: ver todos   L/R: pagina   START: salir"
+                                  : "X: ver   TRIANGULO: buscar   L/R: pagina   START: salir");
     vita2d_end_drawing(); vita2d_swap_buffers();
   }
 out:
