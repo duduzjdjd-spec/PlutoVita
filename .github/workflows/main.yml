@@ -7,7 +7,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Asegurar curl y openssl
-        run: vdpm curl openssl zlib || true
+        run: vdpm curl openssl zlib zstd || true
       - run: mkdir build && cd build && cmake .. && make
       - uses: actions/upload-artifact@v4
         with:
