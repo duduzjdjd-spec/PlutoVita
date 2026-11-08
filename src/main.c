@@ -98,6 +98,7 @@ static void status(const char *msg) {
 // ---------- HTTP (libcurl + OpenSSL) ----------
 static int g_step = 0, g_err = 0, g_status = 0;
 static volatile int g_abort = 0;          // corta descargas al salir del canal
+static volatile int seek_gen = 0;         // sube con cada salto (adelantar/retroceder): lo viejo se descarta
 struct mem { char *b; size_t n, cap; };
 
 static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
@@ -115,7 +116,7 @@ static size_t wcb(void *p, size_t sz, size_t nm, void *u) {
 }
 
 static int xferinfo(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
-  return g_abort ? 1 : 0;
+  return (g_abort || (int)(intptr_t)u != seek_gen) ? 1 : 0;   // tambien corta si el usuario salto a otro punto
 }
 
 static char jwt[2048];
@@ -144,6 +145,7 @@ static char *http_req(const char *url, int *outlen, int bearer) {
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xferinfo);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *)(intptr_t)seek_gen);
   g_step = 4;
   CURLcode rc = curl_easy_perform(c);
   g_err = (int)rc;
@@ -368,14 +370,15 @@ static int pick_variant(const char *m, const char *base, char *out, int cap, cha
 }
 
 // ---- Colas de segmentos (red -> demux) ----
-typedef struct Seg { struct Seg *next; uint8_t *data; int len, epoch, reset; } Seg;
+typedef struct Seg { struct Seg *next; uint8_t *data; int len, epoch, reset, gen; } Seg;
 typedef struct { Seg *head, *tail; int count; } SegQ;
 static SegQ vsq, asq;            // video (y audio si va junto) / audio aparte
 
-static void seg_push(SegQ *q, uint8_t *d, int len, int epoch, int reset) {
+static void seg_push(SegQ *q, uint8_t *d, int len, int epoch, int reset, int gen) {
   Seg *s = malloc(sizeof *s); if (!s) { free(d); return; }
-  s->next = NULL; s->data = d; s->len = len; s->epoch = epoch; s->reset = reset;
+  s->next = NULL; s->data = d; s->len = len; s->epoch = epoch; s->reset = reset; s->gen = gen;
   lock();
+  if (gen != seek_gen) { unlock(); free(d); free(s); return; }   // llego tarde: ya se salto a otro punto
   if (q->tail) q->tail->next = s; else q->head = s;
   q->tail = s; q->count++;
   unlock();
@@ -413,7 +416,7 @@ static int aes_decrypt(const uint8_t *key, const uint8_t *in, int len, const uin
 // ---- Hilos de red: recargan su lista y bajan segmentos ----
 // Hay uno para el video y, si el canal trae el audio en otra lista, otro para el audio.
 #define MAX_SEGS 4096          // una pelicula de 2 h tiene ~1200 segmentos
-typedef struct { char *uri; char *key; int epoch, method, has_iv; uint8_t iv[16]; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
+typedef struct { char *uri; char *key; int epoch, method, has_iv; uint8_t iv[16]; float dur; } SegInfo;  // method: 0 nada, 1 AES-128, 2 otro
 typedef struct {
   char url[4096], orig[4096];
   int mode;                      // audio: 0 URL original, 1 ruta + parametros del video, 2 original + parametros del video
@@ -424,6 +427,10 @@ typedef struct {
   SegInfo segs[MAX_SEGS];
 } NetCtx;
 static NetCtx *vnet, *anet;
+
+// A la carta: duracion total y a donde saltar (en segundos)
+static volatile int is_vod;
+static volatile double vod_total, seek_target, seek_landed;
 
 // La lista de audio aparte rechazada (401): prueba con los parametros de la lista de video, que si funciona
 static void audio_alt_url(NetCtx *c) {
@@ -450,12 +457,13 @@ static int get_key(NetCtx *c, const char *uri) {
 static int net_thread(SceSize a, void *argp) {
   NetCtx *c = *(NetCtx **)argp;
   int64_t next_seq = -1;
-  int pending_reset = 0;
+  int pending_reset = 0, gen = seek_gen;
   while (playing) {
     int len = 0;
     char *pl = http_get(c->url, &len);
     st.http = g_status; st.curl = g_err;
     if (c->is_audio) st.ahttp = g_status;
+    if (!pl && gen != seek_gen) continue;            // se corto por un salto: no es un error
     if (!pl) {
       if (c->is_audio) {
         st.apl_err++;
@@ -466,6 +474,7 @@ static int net_thread(SceSize a, void *argp) {
     if (c->is_audio) st.apl_loads++; else st.pl_loads++;
     int64_t mseq = 0, dseq = 0; int tdur = 6, n = 0, ended = 0, dcount = 0;
     int method = 0, has_iv = 0; uint8_t iv[16]; c->cur_key[0] = 0;
+    float dur = 0;
     memset(iv, 0, 16);
     const char *p = pl;
     while ((p = next_line(p, c->line, sizeof c->line)) != NULL) {
@@ -475,6 +484,7 @@ static int net_thread(SceSize a, void *argp) {
       else if (!strncmp(line, "#EXT-X-TARGETDURATION:", 22)) tdur = atoi(line + 22);
       else if (!strncmp(line, "#EXT-X-DISCONTINUITY", 20) && line[20] != '-') dcount++;
       else if (!strncmp(line, "#EXT-X-ENDLIST", 14)) ended = 1;
+      else if (!strncmp(line, "#EXTINF:", 8)) dur = (float)atof(line + 8);
       else if (!strncmp(line, "#EXT-X-KEY:", 11)) {
         method = strstr(line, "METHOD=NONE") ? 0 : strstr(line, "METHOD=AES-128") ? 1 : 2;
         if (method == 2) { const char *m = strstr(line, "METHOD="); snprintf(st.keymethod, sizeof st.keymethod, "%.20s", m ? m + 7 : "?"); }
@@ -502,6 +512,7 @@ static int net_thread(SceSize a, void *argp) {
             si->method = method; si->has_iv = has_iv;
             memcpy(si->iv, iv, 16);
             si->key = method == 1 && c->cur_key[0] ? strdup(c->cur_key) : NULL;
+            si->dur = dur > 0 ? dur : (float)tdur;
             n++;
           }
         }
@@ -512,18 +523,30 @@ static int net_thread(SceSize a, void *argp) {
     if (next_seq < 0) next_seq = ended ? mseq : mseq + (n > 3 ? n - 3 : 0);   // a la carta: desde el inicio; en vivo: cerca del final
     else if (next_seq > mseq + n + 10) next_seq = mseq + (n > 3 ? n - 3 : 0);
     if (next_seq < mseq) { next_seq = mseq; pending_reset = 1; }   // nos quedamos atras
+    if (ended && !c->is_audio) {                       // a la carta: duracion total para la barra
+      double tot = 0; for (int i = 0; i < n; i++) tot += c->segs[i].dur;
+      vod_total = tot; is_vod = 1;
+    }
+    if (gen != seek_gen) {                             // el usuario salto: busca el segmento de ese momento
+      gen = seek_gen;
+      double t = 0, target = seek_target; int idx = 0;
+      for (idx = 0; idx < n - 1 && t + c->segs[idx].dur <= target; idx++) t += c->segs[idx].dur;
+      next_seq = mseq + idx; pending_reset = 1;
+      if (!c->is_audio) seek_landed = t;
+    }
     int got = 0;
-    for (int i = 0; i < n && playing; i++) {
+    for (int i = 0; i < n && playing && gen == seek_gen; i++) {
       int64_t seq = mseq + i;
       if (seq < next_seq) continue;
-      while (playing && c->q->count >= SEG_AHEAD) nap_ms(20);
-      if (!playing) break;
+      while (playing && gen == seek_gen && c->q->count >= SEG_AHEAD) nap_ms(20);
+      if (!playing || gen != seek_gen) break;
       SegInfo *si = &c->segs[i];
       next_seq = seq + 1;
       if (si->method == 2) { st.enc_other++; pending_reset = 1; continue; }   // cifrado que no se puede abrir (DRM)
       int sl = 0;
       char *d = http_get(si->uri, &sl);
       st.http = g_status; st.curl = g_err;
+      if (!d && gen != seek_gen) break;
       if (!d) { if (c->is_audio) st.aseg_err++; else st.seg_err++; pending_reset = 1; continue; }
       if (si->method == 1) {
         st.enc_aes++;
@@ -535,28 +558,35 @@ static int net_thread(SceSize a, void *argp) {
         if (pn < 0) { st.dec_fail++; pending_reset = 1; continue; }
         d = (char *)plain; sl = pn;
       }
-      seg_push(c->q, (uint8_t *)d, sl, si->epoch, pending_reset);
+      seg_push(c->q, (uint8_t *)d, sl, si->epoch, pending_reset, gen);
       pending_reset = 0; got = 1;
       if (c->is_audio) st.asegs++; else st.segs++;
     }
     for (int i = 0; i < n; i++) { free(c->segs[i].uri); free(c->segs[i].key); c->segs[i].uri = c->segs[i].key = NULL; }
-    if (ended && !got) { if (!c->is_audio) snprintf(st.msg, sizeof st.msg, "Fin de la transmision"); break; }
+    if (gen != seek_gen) continue;
+    if (ended && !got) {                               // termino: espera por si el usuario retrocede
+      if (!c->is_audio) snprintf(st.msg, sizeof st.msg, "Fin");
+      while (playing && gen == seek_gen) nap_ms(100);
+      st.msg[0] = 0;
+      continue;
+    }
     if (!got) nap_ms(tdur * 500);
   }
   return 0;
 }
 
 // ---- Cola de video comprimido (demux -> decodificador) ----
-typedef struct VAu { struct VAu *next; uint8_t *data; int len; int64_t pts; int epoch; } VAu;
+typedef struct VAu { struct VAu *next; uint8_t *data; int len; int64_t pts; int epoch, gen; } VAu;
 static VAu *vq_head, *vq_tail; static int vq_count;
 
-static void vq_push(const uint8_t *d, int len, int64_t pts, int epoch) {
-  while (playing && vq_count >= VQ_MAX) nap_ms(5);
-  if (!playing) return;
+static void vq_push(const uint8_t *d, int len, int64_t pts, int epoch, int gen) {
+  while (playing && gen == seek_gen && vq_count >= VQ_MAX) nap_ms(5);
+  if (!playing || gen != seek_gen) return;
   VAu *v = malloc(sizeof *v); if (!v) return;
   v->data = malloc(len); if (!v->data) { free(v); return; }
-  memcpy(v->data, d, len); v->len = len; v->pts = pts; v->epoch = epoch; v->next = NULL;
+  memcpy(v->data, d, len); v->len = len; v->pts = pts; v->epoch = epoch; v->gen = gen; v->next = NULL;
   lock();
+  if (gen != seek_gen) { unlock(); free(v->data); free(v); return; }
   if (vq_tail) vq_tail->next = v; else vq_head = v;
   vq_tail = v; vq_count++;
   unlock();
@@ -571,14 +601,20 @@ static VAu *vq_pop(void) {
 }
 
 // ---- Audio decodificado (demux -> hilo de audio) ----
-typedef struct { int64_t pts; int epoch, samples, rate, ch; int16_t pcm[2048 * 2]; } Pcm;
+typedef struct { int64_t pts; int epoch, samples, rate, ch, gen; int16_t pcm[2048 * 2]; } Pcm;
 static Pcm *pcm_ring; static int pcm_rd, pcm_wr, pcm_count;
 
 // ---- Reloj comun (90 kHz, como los PTS) ----
 static int clk_set, clk_epoch;
 static int64_t clk_pts; static uint64_t clk_us;
-static int64_t clock_now(void) { return clk_pts + (int64_t)(now_us() - clk_us) * 9 / 100; }
-static void clock_set(int64_t pts, int epoch) { clk_pts = pts; clk_us = now_us(); clk_epoch = epoch; clk_set = 1; }
+static volatile int paused;
+static int64_t pause_pts;
+static int64_t clock_now(void) { return paused ? pause_pts : clk_pts + (int64_t)(now_us() - clk_us) * 9 / 100; }
+static void clock_set(int64_t pts, int epoch) { clk_pts = pts; clk_us = now_us(); clk_epoch = epoch; clk_set = 1; pause_pts = pts; }
+
+// Posicion en segundos (a la carta): base + lo que avanzo el reloj desde el primer cuadro tras el salto
+static int pos_valid; static double pos_base; static int64_t pos_pts;
+static double cur_pos(void) { return pos_valid ? pos_base + (double)(clock_now() - pos_pts) / 90000.0 : pos_base; }
 
 // ---- Memoria para el decodificador ----
 enum { M_PHYCONT = 0, M_CDRAM, M_MAIN_NC, M_KINDS };
@@ -771,11 +807,22 @@ static int free_slot(void) {
 }
 
 static int vdec_thread(SceSize a, void *u) {
-  int cur_cw = 0, cur_ch = 0, failed = 0;
+  int cur_cw = 0, cur_ch = 0, failed = 0, my_gen = seek_gen;
   int64_t last_in = -1, frame_dur = 3003, last_out = -1;
   while (playing) {
     VAu *au = vq_pop();
     if (!au) { sceKernelDelayThread(2000); continue; }
+    if (au->gen != seek_gen) { free(au->data); free(au); continue; }
+    if (au->gen != my_gen) {
+      // salto: el decodificador guarda cuadros viejos; se cierra y se abre con el siguiente cuadro clave
+      my_gen = au->gen; last_in = last_out = -1;
+      if (vdec) {
+        vreset_ack = 0; vreset_req = 1;
+        while (playing && !vreset_ack) sceKernelDelayThread(2000);
+        vreset_req = 0;
+        vdec_close();
+      }
+    }
     int cw, ch, vw, vh;
     int has_sps = find_sps(au->data, au->len, &cw, &ch, &vw, &vh) == 0;
     if (has_sps && vdec && (cw != cur_cw || ch != cur_ch)) {
@@ -823,7 +870,7 @@ static int vdec_thread(SceSize a, void *u) {
       pts_tried = 1; use_pts = 0;      // algunos firmwares quieren los PTS en 0xFFFFFFFF: reintenta sin ellos
     }
     if (r >= 0) pts_tried = 1;
-    int ep = au->epoch;
+    int ep = au->epoch, ag = au->gen;
     free(au->data); free(au);
     if (r < 0) { st.dec_err++; st.last_dec_err = (unsigned)r; continue; }
     if (arr.numOfOutput == 0) continue;
@@ -833,8 +880,10 @@ static int vdec_thread(SceSize a, void *u) {
     if (opts < 0 && last_out >= 0) opts = last_out + frame_dur;
     if (opts >= 0) last_out = opts;
     lock();
-    slots[si].pts = opts; slots[si].epoch = ep; slots[si].seq = out_seq++;
-    slots[si].state = SL_READY;
+    if (ag == seek_gen) {
+      slots[si].pts = opts; slots[si].epoch = ep; slots[si].seq = out_seq++;
+      slots[si].state = SL_READY;
+    }
     unlock();
     st.frames++;
   }
@@ -887,7 +936,7 @@ static int rate_ok(int r) {
 }
 
 // Un cuadro ADTS completo -> PCM a la cola
-static void audio_frame(const uint8_t *d, int len, int64_t pts, int epoch) {
+static void audio_frame(const uint8_t *d, int len, int64_t pts, int epoch, int gen) {
   int sfi = (d[2] >> 2) & 15, ch = ((d[2] & 1) << 2) | (d[3] >> 6);
   if (sfi >= 13) return;
   int rate = ADTS_RATES[sfi];
@@ -905,12 +954,14 @@ static void audio_frame(const uint8_t *d, int len, int64_t pts, int epoch) {
   if (r < 0) { st.aerr++; st.last_aerr = (unsigned)r; return; }
   int samples = (int)(actrl.outputPcmSize / (2u * ch));
   if (samples <= 0 || samples > 2048 || samples % 64) { st.aerr++; return; }
-  while (playing && pcm_count >= PCM_SLOTS) nap_ms(5);
-  if (!playing) return;
+  while (playing && gen == seek_gen && pcm_count >= PCM_SLOTS) nap_ms(5);
+  lock();
+  if (!playing || gen != seek_gen || pcm_count >= PCM_SLOTS) { unlock(); return; }
   Pcm *c = &pcm_ring[pcm_wr];
-  c->pts = pts; c->epoch = epoch; c->samples = samples; c->rate = rate; c->ch = ch;
+  c->pts = pts; c->epoch = epoch; c->samples = samples; c->rate = rate; c->ch = ch; c->gen = gen;
   memcpy(c->pcm, apcm, (size_t)samples * 2 * ch);
-  lock(); pcm_wr = (pcm_wr + 1) % PCM_SLOTS; pcm_count++; unlock();
+  pcm_wr = (pcm_wr + 1) % PCM_SLOTS; pcm_count++;
+  unlock();
   st.aframes++;
 }
 
@@ -918,7 +969,7 @@ static void audio_frame(const uint8_t *d, int len, int64_t pts, int epoch) {
 typedef struct { uint8_t *buf; int len, cap, want, started; int64_t pts; } Pes;
 typedef struct {
   SegQ *q;
-  int pmt_pid, vpid, apid, epoch, use_audio;
+  int pmt_pid, vpid, apid, epoch, use_audio, gen;
   Pes vpes, apes;
   char *types;                   // tipos de pista vistos (para la pantalla de datos)
 } Dmx;
@@ -942,7 +993,7 @@ static void pes_append(Pes *p, const uint8_t *d, int n) {
 }
 
 // Recorre cuadros ADTS seguidos; el primero tiene pts0 y los demas avanzan 1024 muestras
-static void adts_run(const uint8_t *buf, int len, int64_t pts0, int epoch) {
+static void adts_run(const uint8_t *buf, int len, int64_t pts0, int epoch, int gen) {
   int i = 0, k = 0;
   while (i + 7 <= len && playing) {
     const uint8_t *d = buf + i;
@@ -952,15 +1003,15 @@ static void adts_run(const uint8_t *buf, int len, int64_t pts0, int epoch) {
     int sfi = (d[2] >> 2) & 15;
     int rate = sfi < 13 ? ADTS_RATES[sfi] : 48000;
     int64_t pts = pts0 >= 0 ? pts0 + (int64_t)k * 1024 * 90000 / rate : -1;
-    audio_frame(d, fl, pts, epoch);
+    audio_frame(d, fl, pts, epoch, gen);
     i += fl; k++;
   }
 }
 
 static void pes_flush(Dmx *x, Pes *p, int is_video) {
   if (p->started && p->len > 0) {
-    if (is_video) vq_push(p->buf, p->len, p->pts, x->epoch);
-    else adts_run(p->buf, p->len, p->pts, x->epoch);
+    if (is_video) vq_push(p->buf, p->len, p->pts, x->epoch, x->gen);
+    else adts_run(p->buf, p->len, p->pts, x->epoch, x->gen);
   }
   p->len = 0; p->started = 0; p->want = 0; p->pts = -1;
 }
@@ -1041,6 +1092,10 @@ static int64_t id3_pts(const uint8_t *d, int len, int *hdr) {
 }
 
 static void dmx_segment(Dmx *x, Seg *s) {
+  if (s->gen != x->gen) {                        // salto: lo que quedaba a medias se tira
+    x->vpes.len = x->apes.len = 0; x->vpes.started = x->apes.started = 0;
+    ts_reset(x); x->gen = s->gen; x->epoch = s->epoch;
+  }
   if (s->reset || s->epoch != x->epoch) {
     pes_flush(x, &x->vpes, 1); pes_flush(x, &x->apes, 0);
     ts_reset(x); x->epoch = s->epoch;
@@ -1050,7 +1105,7 @@ static void dmx_segment(Dmx *x, Seg *s) {
     if (!x->use_audio) return;
     int h; int64_t pts = id3_pts(d, s->len, &h);
     st.packed++;
-    adts_run(d + h, s->len - h, pts, x->epoch);
+    adts_run(d + h, s->len - h, pts, x->epoch, x->gen);
     return;
   }
   int i = 0;
@@ -1067,7 +1122,7 @@ static int demux_thread(SceSize a, void *argp) {
   while (playing) {
     Seg *s = seg_pop(x->q);
     if (!s) { sceKernelDelayThread(5000); continue; }
-    dmx_segment(x, s);
+    if (s->gen == seek_gen) dmx_segment(x, s);
     free(s->data); free(s);
   }
   return 0;
@@ -1080,9 +1135,11 @@ static int audio_thread(SceSize a, void *u) {
   obuf[0] = memalign(64, 2048 * 2 * 2); obuf[1] = memalign(64, 2048 * 2 * 2);
   uint64_t wait0 = 0;
   while (playing) {
+    if (paused) { sceKernelDelayThread(10000); continue; }
     lock();
     if (pcm_count == 0) { unlock(); sceKernelDelayThread(5000); continue; }
     Pcm *c = &pcm_ring[pcm_rd];
+    if (c->gen != seek_gen) { pcm_rd = (pcm_rd + 1) % PCM_SLOTS; pcm_count--; unlock(); continue; }
     if (!clk_set || c->epoch > clk_epoch) {
       // espera a que el video ponga el reloj; si en 2 s no hay video, el audio lo pone
       if (!wait0) wait0 = now_us();
@@ -1151,13 +1208,20 @@ static void pick_frame(void) {
     if (f < 0) break;
     Slot *s = &slots[f];
     if (!clk_set || s->epoch != clk_epoch || s->pts < 0) {
-      if (s->pts >= 0) clock_set(s->pts, s->epoch);
+      if (s->pts >= 0) {
+        if (!clk_set) { pos_base = seek_landed; }        // primer cuadro tras empezar o saltar
+        else pos_base = cur_pos();                       // cambio de tramo (anuncio): la posicion sigue
+        clock_set(s->pts, s->epoch);
+        pos_pts = s->pts; pos_valid = 1;
+      }
       take_frame(f); break;
     }
     int64_t d = s->pts - clock_now();
-    if (d > 5 * 90000) { clock_set(s->pts, s->epoch); take_frame(f); break; }   // salto raro: re-ancla
+    if (d > 5 * 90000 || d < -90000) {                   // salto raro o >1 s tarde: re-ancla
+      pos_base = cur_pos(); clock_set(s->pts, s->epoch); pos_pts = s->pts;
+      take_frame(f); break;
+    }
     if (d > 0) break;                                                        // aun no toca
-    if (d < -90000) { clock_set(s->pts, s->epoch); take_frame(f); break; }   // >1 s tarde: re-ancla
     int g = oldest_ready(f);
     if (g >= 0 && slots[g].epoch == clk_epoch && slots[g].pts >= 0 && slots[g].pts <= clock_now()) {
       s->state = SL_FREE; st.dropped++; continue;                           // ya toca el siguiente
@@ -1165,6 +1229,57 @@ static void pick_frame(void) {
     take_frame(f); break;
   }
   unlock();
+}
+
+// Salta a "target" segundos: vacia todo y la red vuelve a empezar desde ese segmento
+static void do_seek(double target) {
+  if (target < 0) target = 0;
+  if (vod_total > 10 && target > vod_total - 5) target = vod_total - 5;
+  lock();
+  seek_target = target; seek_landed = target;
+  seek_gen++;
+  SegQ *qs[2] = { &vsq, &asq };
+  for (int k = 0; k < 2; k++) {
+    Seg *s = qs[k]->head;
+    while (s) { Seg *nx = s->next; free(s->data); free(s); s = nx; }
+    qs[k]->head = qs[k]->tail = NULL; qs[k]->count = 0;
+  }
+  VAu *v = vq_head;
+  while (v) { VAu *nx = v->next; free(v->data); free(v); v = nx; }
+  vq_head = vq_tail = NULL; vq_count = 0;
+  pcm_rd = pcm_wr = pcm_count = 0;
+  for (int i = 0; i < NSLOTS; i++) if (slots[i].state == SL_READY) slots[i].state = SL_FREE;
+  clk_set = 0; paused = 0;
+  pos_base = target; pos_valid = 0;
+  unlock();
+}
+
+static void toggle_pause(void) {
+  lock();
+  if (!paused) { pause_pts = clock_now(); paused = 1; }
+  else { clk_pts = pause_pts; clk_us = now_us(); paused = 0; }
+  unlock();
+}
+
+static void fmt_time(double t, char *o, int cap) {
+  if (t < 0) t = 0;
+  int s = (int)t, h = s / 3600, m = (s / 60) % 60; s %= 60;
+  if (h) snprintf(o, cap, "%d:%02d:%02d", h, m, s); else snprintf(o, cap, "%d:%02d", m, s);
+}
+
+// Barra de reproduccion (a la carta)
+static void draw_osd(double pos, int pending, double target) {
+  char a[16], b[16], c[16], l[96];
+  double tot = vod_total > 0 ? vod_total : 1;
+  vita2d_draw_rectangle(0, 470, 960, 74, RGBA8(0,0,0,190));
+  vita2d_draw_rectangle(30, 486, 900, 8, RGBA8(90,90,90,255));
+  double f = (pending ? target : pos) / tot; if (f < 0) f = 0; if (f > 1) f = 1;
+  vita2d_draw_rectangle(30, 486, (float)(900 * f), 8, pending ? RGBA8(255,200,60,255) : RGBA8(90,140,255,255));
+  fmt_time(pos, a, sizeof a); fmt_time(vod_total, b, sizeof b); fmt_time(target, c, sizeof c);
+  if (pending) snprintf(l, sizeof l, "%s / %s   ->  %s", a, b, c);
+  else snprintf(l, sizeof l, "%s / %s%s", a, b, paused ? "   PAUSA" : "");
+  vita2d_pgf_draw_text(pgf, 30, 522, RGBA8(255,255,255,255), 1.0f, l);
+  vita2d_pgf_draw_text(pgf, 520, 522, RGBA8(170,170,170,255), 0.8f, "</>: 10 s   L/R: 1 min   CUADRADO: pausa");
 }
 
 static void draw_debug(int y0) {
@@ -1252,6 +1367,8 @@ static void play_stream(const char *kind, const char *id) {
   if (!pcm_ring) { status("Sin memoria"); sceKernelDelayThread(3000000); sceKernelDeleteMutex(mtx); free(vnet); free(anet); vnet = anet = NULL; return; }
 
   playing = 1; g_abort = 0;
+  is_vod = 0; vod_total = 0; seek_target = seek_landed = 0; paused = 0;
+  pos_valid = 0; pos_base = 0;
   SceUID th_net = sceKernelCreateThread("pv_net",   net_thread,   0x10000100, 256 * 1024, 0, 0, NULL);
   SceUID th_dmx = sceKernelCreateThread("pv_demux", demux_thread, 0x10000100, 128 * 1024, 0, 0, NULL);
   SceUID th_vid = sceKernelCreateThread("pv_video", vdec_thread,  0x10000100, 64 * 1024,  0, 0, NULL);
@@ -1269,12 +1386,31 @@ static void play_stream(const char *kind, const char *id) {
     arg = &admx; sceKernelStartThread(th_admx, sizeof arg, &arg);
   }
 
-  int show_dbg = 0;
+  int show_dbg = 0, seek_pend = 0;
+  double seek_to = 0;
+  uint64_t seek_t = 0, osd_until = 0;
   while (playing) {
     sceCtrlPeekBufferPositive(0, &pad, 1);
     unsigned pr = pad.buttons & ~oldpad.buttons; oldpad = pad;
     if (pr & SCE_CTRL_CIRCLE) break;
     if (pr & SCE_CTRL_TRIANGLE) show_dbg = !show_dbg;
+    if (is_vod) {
+      int step = 0;
+      if (pr & SCE_CTRL_LEFT) step = -10;
+      if (pr & SCE_CTRL_RIGHT) step = 10;
+      if (pr & SCE_CTRL_LTRIGGER) step = -60;
+      if (pr & SCE_CTRL_RTRIGGER) step = 60;
+      if (step) {                                    // junta varios toques antes de saltar
+        if (!seek_pend) { lock(); seek_to = cur_pos(); unlock(); seek_pend = 1; }
+        seek_to += step;
+        if (seek_to < 0) seek_to = 0;
+        if (vod_total > 0 && seek_to > vod_total) seek_to = vod_total;
+        seek_t = now_us(); osd_until = seek_t + 3000000;
+      }
+      if (seek_pend && now_us() - seek_t > 700000) { do_seek(seek_to); seek_pend = 0; osd_until = now_us() + 3000000; }
+      if (pr & SCE_CTRL_SQUARE) { toggle_pause(); osd_until = now_us() + 3000000; }
+      if (pr & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_CROSS)) osd_until = now_us() + 3000000;
+    }
 
     pick_frame();
     vita2d_start_drawing(); vita2d_clear_screen();
@@ -1289,6 +1425,10 @@ static void play_stream(const char *kind, const char *id) {
     if (show_dbg || sh < 0) {
       if (sh >= 0) vita2d_draw_rectangle(0, 286, 960, 258, RGBA8(0,0,0,170));
       draw_debug(sh >= 0 ? 310 : 110);
+    }
+    if (is_vod && !show_dbg && (paused || seek_pend || now_us() < osd_until)) {
+      lock(); double pos = cur_pos(); unlock();
+      draw_osd(pos, seek_pend, seek_to);
     }
     vita2d_end_drawing();
     vita2d_wait_rendering_done();       // la GPU termino: ya se pueden reciclar los cuadros
@@ -1402,10 +1542,11 @@ static int ime_search(char *query, int cap) {
 
 // ---------- Pantalla de lista generica (con buscador) ----------
 // Devuelve el indice elegido, o LS_BACK (O), LS_MODE (SELECT), LS_EXIT (START)
-enum { LS_BACK = -1, LS_MODE = -2, LS_EXIT = -3 };
+enum { LS_BACK = -1, LS_MODE = -2, LS_EXIT = -3, LS_SEARCH = -4 };
 typedef struct { int sel, top; char query[128]; } ListState;
 
-static int list_screen(const char *title, const char *const *names, int n, ListState *ls, const char *hint) {
+// global_search: TRIANGULO no filtra esta lista, devuelve LS_SEARCH para que el llamador busque en todo
+static int list_screen_ex(const char *title, const char *const *names, int n, ListState *ls, const char *hint, int global_search) {
   int *view = malloc(sizeof(int) * (n > 0 ? n : 1));
   if (!view) return LS_BACK;
   int nview = 0, rebuild = 1, ret = LS_BACK;
@@ -1435,6 +1576,7 @@ static int list_screen(const char *title, const char *const *names, int n, ListS
     if (p & SCE_CTRL_CIRCLE) { ret = LS_BACK; break; }
     if (p & SCE_CTRL_SELECT) { ret = LS_MODE; break; }
     if (p & SCE_CTRL_START) { ret = LS_EXIT; break; }
+    if ((p & SCE_CTRL_TRIANGLE) && global_search) { ret = LS_SEARCH; break; }
     if (p & SCE_CTRL_TRIANGLE) { if (ime_search(ls->query, sizeof ls->query)) { ls->sel = ls->top = 0; rebuild = 1; } continue; }
     if ((p & SCE_CTRL_SQUARE) && ls->query[0]) { ls->query[0] = 0; ls->sel = ls->top = 0; rebuild = 1; }
 
@@ -1460,6 +1602,9 @@ static int list_screen(const char *title, const char *const *names, int n, ListS
   }
   free(view);
   return ret;
+}
+static int list_screen(const char *title, const char *const *names, int n, ListState *ls, const char *hint) {
+  return list_screen_ex(title, names, n, ls, hint, 0);
 }
 
 static void show_error(const char *what) {
@@ -1644,7 +1789,7 @@ static int load_categories(void) {
 }
 
 // Peliculas y series de una categoria
-static int load_items(int ci, EntryList *out) {
+static int load_items(int ci, EntryList *out, int quiet) {
   memset(out, 0, sizeof *out);
   const char *arr = NULL;
   // en v3 las peliculas vienen dentro de la categoria
@@ -1657,7 +1802,7 @@ static int load_items(int ci, EntryList *out) {
     }
   }
   if (arr) { add_items(out, arr); el_names(out); return out->n ? 0 : -1; }
-  status("Descargando titulos...");
+  if (!quiet) status("Descargando titulos...");
   char url[512]; snprintf(url, sizeof url, VOD_ITEMS_V4, vod_cats.e[ci].id);
   char *doc = http_req(url, NULL, 1);
   if (!doc) return -1;
@@ -1703,35 +1848,108 @@ static int load_episodes(const char *series_id, EntryList *out) {
   return out->n ? 0 : -1;
 }
 
+// Abre un titulo: pelicula -> reproduce; serie -> lista de episodios. Devuelve 0, LS_MODE o LS_EXIT.
+static int open_item(const Entry *it) {
+  if (it->kind == 1) { play_stream("episode", it->id); return 0; }   // las peliculas tambien van por "episode"
+  EntryList eps; ListState ep_ls; memset(&ep_ls, 0, sizeof ep_ls);
+  char sid_copy[40], t2[160];
+  snprintf(sid_copy, sizeof sid_copy, "%s", it->id);
+  snprintf(t2, sizeof t2, "%s", it->name);
+  if (load_episodes(sid_copy, &eps) < 0) { el_free(&eps); show_error("No se pudieron bajar los episodios"); return 0; }
+  int r = 0;
+  for (;;) {
+    int ei = list_screen(t2, eps.names, eps.n, &ep_ls, "X: ver   O: volver   SELECT: en vivo");
+    if (ei == LS_MODE || ei == LS_EXIT) { r = ei; break; }
+    if (ei == LS_BACK) break;
+    play_stream("episode", eps.e[ei].id);
+  }
+  el_free(&eps);
+  return r;
+}
+
+// ---- Indice de todos los titulos (para buscar desde las categorias) ----
+static EntryList all_items;
+static int all_done;             // ya se recorrieron todas las categorias
+static int all_next;             // siguiente categoria por recorrer (si se cancelo a medias)
+#define IDX_HASH 16384
+static int *all_hash;            // ids ya vistos (sin repetir titulos que estan en varias categorias)
+
+static unsigned str_hash(const char *s) { unsigned h = 2166136261u; while (*s) h = (h ^ (unsigned char)*s++) * 16777619u; return h; }
+static int seen_or_add(const char *id, int idx) {
+  if (!all_hash) { all_hash = malloc(sizeof(int) * IDX_HASH); if (!all_hash) return 0; for (int i = 0; i < IDX_HASH; i++) all_hash[i] = -1; }
+  unsigned h = str_hash(id) & (IDX_HASH - 1);
+  for (int k = 0; k < IDX_HASH; k++, h = (h + 1) & (IDX_HASH - 1)) {
+    if (all_hash[h] < 0) { all_hash[h] = idx; return 0; }
+    if (!strcmp(all_items.e[all_hash[h]].id, id)) return 1;
+  }
+  return 1;                      // tabla llena: lo trata como repetido
+}
+
+// Recorre las categorias que falten. Devuelve 0 si termino, 1 si el usuario cancelo con O.
+static int build_index(void) {
+  while (!all_done) {
+    if (all_next >= vod_cats.n) { all_done = 1; break; }
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    if (pad.buttons & SCE_CTRL_CIRCLE) { oldpad = pad; el_names(&all_items); return 1; }
+    char m[200];
+    snprintf(m, sizeof m, "Buscando en el catalogo... %d/%d  (O = cancelar)", all_next + 1, vod_cats.n);
+    status(m);
+    EntryList tmp;
+    if (load_items(all_next, &tmp, 1) == 0) {
+      for (int i = 0; i < tmp.n; i++) {
+        int idx = all_items.n;
+        Entry *e = el_add(&all_items); if (!e) break;
+        *e = tmp.e[i];
+        if (seen_or_add(e->id, idx)) all_items.n--;
+      }
+    }
+    el_free(&tmp);
+    all_next++;
+  }
+  el_names(&all_items);
+  return 0;
+}
+
+// Busca peliculas y series en todo el catalogo. Devuelve 0, LS_MODE o LS_EXIT.
+static int global_search(void) {
+  static ListState res_ls;
+  char q[128]; snprintf(q, sizeof q, "%s", res_ls.query);
+  if (!ime_search(q, sizeof q) || !q[0]) return 0;
+  int cancelled = build_index();
+  snprintf(res_ls.query, sizeof res_ls.query, "%s", q);
+  res_ls.sel = res_ls.top = 0;
+  for (;;) {
+    int r = list_screen("Buscar en peliculas y series", all_items.names, all_items.n, &res_ls,
+                        cancelled ? "Busqueda parcial (se cancelo el recorrido)   X: ver / abrir   O: categorias"
+                                  : "X: ver / abrir serie   O: categorias   SELECT: en vivo");
+    if (r == LS_MODE || r == LS_EXIT) return r;
+    if (r == LS_BACK) return 0;
+    Entry it = all_items.e[r];          // copia: el indice no cambia mientras tanto, pero por si acaso
+    int o = open_item(&it);
+    if (o) return o;
+  }
+}
+
 // Navegador: categorias -> titulos -> (serie) episodios. Devuelve LS_MODE o LS_EXIT.
 static int vod_browse(void) {
   static ListState cat_ls;
   if (load_categories() < 0) { show_error("No se pudo bajar el catalogo"); return LS_MODE; }
   for (;;) {
-    int ci = list_screen("A la carta: categorias", vod_cats.names, vod_cats.n, &cat_ls,
-                         "X: abrir   SELECT: canales en vivo");
+    int ci = list_screen_ex("A la carta: categorias", vod_cats.names, vod_cats.n, &cat_ls,
+                            "X: abrir   TRIANGULO: buscar pelicula o serie   SELECT: en vivo", 1);
     if (ci == LS_MODE || ci == LS_EXIT) return ci;
     if (ci == LS_BACK) return LS_MODE;
+    if (ci == LS_SEARCH) { int g = global_search(); if (g) return g; continue; }
     EntryList items; ListState item_ls; memset(&item_ls, 0, sizeof item_ls);
-    if (load_items(ci, &items) < 0) { el_free(&items); show_error("Categoria vacia o sin acceso"); continue; }
+    if (load_items(ci, &items, 0) < 0) { el_free(&items); show_error("Categoria vacia o sin acceso"); continue; }
     char title[160]; snprintf(title, sizeof title, "A la carta: %s", vod_cats.e[ci].name);
     for (;;) {
       int ii = list_screen(title, items.names, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo");
       if (ii == LS_MODE || ii == LS_EXIT) { el_free(&items); return ii; }
       if (ii == LS_BACK) break;
-      Entry *it = &items.e[ii];
-      if (it->kind == 1) { play_stream("episode", it->id); continue; }   // las peliculas tambien van por "episode"
-      EntryList eps; ListState ep_ls; memset(&ep_ls, 0, sizeof ep_ls);
-      char sid_copy[40]; snprintf(sid_copy, sizeof sid_copy, "%s", it->id);
-      if (load_episodes(sid_copy, &eps) < 0) { el_free(&eps); show_error("No se pudieron bajar los episodios"); continue; }
-      char t2[160]; snprintf(t2, sizeof t2, "%s", it->name);
-      for (;;) {
-        int ei = list_screen(t2, eps.names, eps.n, &ep_ls, "X: ver   O: volver   SELECT: en vivo");
-        if (ei == LS_MODE || ei == LS_EXIT) { el_free(&eps); el_free(&items); return ei; }
-        if (ei == LS_BACK) break;
-        play_stream("episode", eps.e[ei].id);
-      }
-      el_free(&eps);
+      Entry it = items.e[ii];
+      int o = open_item(&it);
+      if (o) { el_free(&items); return o; }
     }
     el_free(&items);
   }
