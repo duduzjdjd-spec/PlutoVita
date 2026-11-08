@@ -153,6 +153,12 @@ static void play_channel(const Channel *c) {
   char url[4096];
   snprintf(url, sizeof url, STITCH_URL, c->id, uuid, sid, jwt);
   status("Cargando canal...");
+  char dbg1[200], dbg2[200], dbg3[200];
+  { int plen = 0; char *pl = http_get(url, &plen);
+    snprintf(dbg1, sizeof dbg1, "curl: err %d  http %d  bytes %d", g_err, g_status, plen);
+    dbg2[0] = 0;
+    if (pl) { int i = 0; for (; pl[i] && pl[i] != '\n' && i < 60; i++) dbg2[i] = (pl[i] < 32 ? ' ' : pl[i]); dbg2[i] = 0; free(pl); }
+  }
 
   SceAvPlayerInitData init; memset(&init, 0, sizeof init);
   init.memoryReplacement.allocate = a_alloc;
@@ -163,7 +169,8 @@ static void play_channel(const Channel *c) {
   init.numOutputVideoFrameBuffers = 5;
   init.autoStart = 1;
   player = sceAvPlayerInit(&init);
-  sceAvPlayerAddSource(player, url);
+  int add_ret = sceAvPlayerAddSource(player, url);
+  snprintf(dbg3, sizeof dbg3, "player: init %d  add %d", (int)player, add_ret);
 
   playing = 1;
   SceUID th = sceKernelCreateThread("pluto_audio", audio_thread, 0x10000100, 0x10000, 0, 0, NULL);
@@ -187,7 +194,14 @@ static void play_channel(const Channel *c) {
     }
     vita2d_start_drawing(); vita2d_clear_screen();
     if (tex) vita2d_draw_texture_scale(tex, 0, 0, 960.0f / tw, 544.0f / thh);
-    else vita2d_pgf_draw_text(pgf, 40, 270, RGBA8(255,255,255,255), 1.2f, "Buffering...  (O = volver)");
+    else {
+      char act[64]; snprintf(act, sizeof act, "activo: %d", (int)sceAvPlayerIsActive(player));
+      vita2d_pgf_draw_text(pgf, 40, 200, RGBA8(255,255,255,255), 1.2f, "Buffering...  (O = volver)");
+      vita2d_pgf_draw_text(pgf, 40, 250, RGBA8(255,255,0,255), 1.0f, dbg1);
+      vita2d_pgf_draw_text(pgf, 40, 290, RGBA8(255,255,0,255), 1.0f, dbg2);
+      vita2d_pgf_draw_text(pgf, 40, 330, RGBA8(255,255,0,255), 1.0f, dbg3);
+      vita2d_pgf_draw_text(pgf, 40, 370, RGBA8(255,255,0,255), 1.0f, act);
+    }
     vita2d_end_drawing(); vita2d_swap_buffers();
   }
   sceKernelWaitThreadEnd(th, NULL, NULL);
