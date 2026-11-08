@@ -22,7 +22,7 @@ target_link_libraries(${PROJECT_NAME}
   vita2d freetype png jpeg z m c
   SceDisplay_stub SceGxm_stub SceCtrl_stub SceSysmodule_stub
   ScePgf_stub ScePvf_stub SceCommonDialog_stub
-  SceNet_stub SceNetCtl_stub SceHttp_stub
+  SceNet_stub SceNetCtl_stub SceHttp_stub SceSsl_stub
   SceAvPlayer_stub SceAudio_stub SceAppUtil_stub
   SceAppMgr_stub SceLibKernel_stub
 )
