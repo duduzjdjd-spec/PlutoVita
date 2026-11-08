@@ -24,6 +24,7 @@ target_link_libraries(${PROJECT_NAME}
   ScePgf_stub ScePvf_stub SceCommonDialog_stub
   SceNet_stub SceNetCtl_stub SceHttp_stub
   SceAvPlayer_stub SceAudio_stub SceAppUtil_stub
+  SceAppMgr_stub SceSharedFb_stub SceLibKernel_stub
 )
 
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
