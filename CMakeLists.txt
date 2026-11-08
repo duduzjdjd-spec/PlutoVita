@@ -8,7 +8,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(PlutoVita C)
-include("${VITASDK}/share/vita.cmake" REQUIRED)
+include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "Pluto TV")
 set(VITA_TITLEID  "PLUT00001")
