@@ -15,6 +15,8 @@ set(VITA_TITLEID  "PLUT00001")
 set(VITA_VERSION  "01.00")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -std=gnu99")
+# VitaSDK reciente: deja espacio para los datos SCE (evita "segment 1 overlaps"); los linkers viejos lo ignoran
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--defsym=__sce_headroom=0x4000")
 
 add_executable(${PROJECT_NAME} src/main.c)
 
@@ -23,7 +25,7 @@ target_link_libraries(${PROJECT_NAME}
   SceDisplay_stub SceGxm_stub SceCtrl_stub SceSysmodule_stub
   ScePgf_stub ScePvf_stub SceCommonDialog_stub
   SceNet_stub SceNetCtl_stub
-  SceAvPlayer_stub SceAudio_stub SceAppUtil_stub
+  SceVideodec_stub SceAudiodec_stub SceAudio_stub SceAppUtil_stub
   SceAppMgr_stub SceLibKernel_stub
 )
 
