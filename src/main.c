@@ -1546,7 +1546,7 @@ enum { LS_BACK = -1, LS_MODE = -2, LS_EXIT = -3, LS_SEARCH = -4 };
 typedef struct { int sel, top; char query[128]; } ListState;
 
 // global_search: TRIANGULO no filtra esta lista, devuelve LS_SEARCH para que el llamador busque en todo
-static int list_screen_ex(const char *title, const char *const *names, int n, ListState *ls, const char *hint, int global_search) {
+static int list_screen_ex(const char *title, const char *const *names, const char *const *keys, int n, ListState *ls, const char *hint, int global_search) {
   int *view = malloc(sizeof(int) * (n > 0 ? n : 1));
   if (!view) return LS_BACK;
   int nview = 0, rebuild = 1, ret = LS_BACK;
@@ -1557,7 +1557,7 @@ static int list_screen_ex(const char *title, const char *const *names, int n, Li
       fold(ls->query, q, sizeof q);
       nview = 0;
       for (int i = 0; i < n; i++) {
-        if (q[0]) { fold(names[i], nm, sizeof nm); if (!strstr(nm, q)) continue; }
+        if (q[0]) { fold(keys ? keys[i] : names[i], nm, sizeof nm); if (!strstr(nm, q)) continue; }
         view[nview++] = i;
       }
       if (ls->sel >= nview) ls->sel = nview > 0 ? nview - 1 : 0;
@@ -1604,7 +1604,7 @@ static int list_screen_ex(const char *title, const char *const *names, int n, Li
   return ret;
 }
 static int list_screen(const char *title, const char *const *names, int n, ListState *ls, const char *hint) {
-  return list_screen_ex(title, names, n, ls, hint, 0);
+  return list_screen_ex(title, names, NULL, n, ls, hint, 0);
 }
 
 static void show_error(const char *what) {
@@ -1715,10 +1715,11 @@ static void jfield(const char *obj, const char *k1, const char *k2, char *dst, i
 }
 
 // ---------- Catalogo a la carta ----------
-typedef struct { char id[40]; char name[96]; int kind; } Entry;     // kind: 0 categoria, 1 pelicula, 2 serie, 3 episodio
-typedef struct { Entry *e; const char **names; int n, cap; } EntryList;
+typedef struct { char id[40]; char name[104]; char title[96]; int kind; } Entry;   // kind: 0 categoria, 1 pelicula, 2 serie, 3 episodio
+// name = lo que se muestra ("[Serie] X"); title = solo el titulo (con eso se busca)
+typedef struct { Entry *e; const char **names, **keys; int n, cap; } EntryList;
 
-static void el_free(EntryList *l) { free(l->e); free(l->names); memset(l, 0, sizeof *l); }
+static void el_free(EntryList *l) { free(l->e); free(l->names); free(l->keys); memset(l, 0, sizeof *l); }
 static Entry *el_add(EntryList *l) {
   if (l->n == l->cap) {
     int nc = l->cap ? l->cap * 2 : 64;
@@ -1730,9 +1731,11 @@ static Entry *el_add(EntryList *l) {
   return &l->e[l->n++];
 }
 static void el_names(EntryList *l) {
-  free(l->names);
+  free(l->names); free(l->keys);
   l->names = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
+  l->keys  = malloc(sizeof(char *) * (l->n > 0 ? l->n : 1));
   if (l->names) for (int i = 0; i < l->n; i++) l->names[i] = l->e[i].name;
+  if (l->keys)  for (int i = 0; i < l->n; i++) l->keys[i] = l->e[i].title[0] ? l->e[i].title : l->e[i].name;
 }
 
 // arreglo de objetos: el de la clave pedida, o el documento si ya es un arreglo
@@ -1742,20 +1745,40 @@ static const char *find_list(const char *doc, const char *key) {
   return jfind(doc, key, '[', 0);
 }
 
+static int el_has(const EntryList *l, const char *id) {
+  for (int i = 0; i < l->n; i++) if (!strcmp(l->e[i].id, id)) return 1;
+  return 0;
+}
+
+// Solo peliculas y series (por titulo). Si la categoria trae un capitulo suelto, se agrega su serie.
 static void add_items(EntryList *l, const char *arr) {
   for (const char *it = jarr_first(arr); it; it = jarr_next(it)) {
     if (*jws(it) != '{') continue;
-    Entry *e = el_add(l); if (!e) break;
-    char type[24];
-    jfield(it, "_id", "id", e->id, sizeof e->id);
-    jfield(it, "name", "title", e->name, sizeof e->name);
+    char type[24], id[40], title[96];
     jfield(it, "type", NULL, type, sizeof type);
-    e->kind = !strcmp(type, "series") ? 2 : 1;
-    if (!e->id[0] || !e->name[0]) { l->n--; continue; }
-    if (e->kind == 2) {                              // marca las series para distinguirlas
-      char tmp[96]; snprintf(tmp, sizeof tmp, "[Serie] %s", e->name);
-      snprintf(e->name, sizeof e->name, "%s", tmp);
-    }
+    int kind;
+    if (!strcmp(type, "series")) {
+      kind = 2;
+      jfield(it, "_id", "id", id, sizeof id);
+      jfield(it, "name", "title", title, sizeof title);
+    } else if (!strcmp(type, "movie") || !type[0]) {
+      kind = 1;
+      jfield(it, "_id", "id", id, sizeof id);
+      jfield(it, "name", "title", title, sizeof title);
+    } else if (!strcmp(type, "episode")) {
+      const char *ser = jget(it, "series");                       // datos de su serie, si vienen
+      if (!ser || *jws(ser) != '{') continue;
+      kind = 2;
+      jfield(ser, "_id", "id", id, sizeof id);
+      jfield(ser, "name", "title", title, sizeof title);
+    } else continue;                                              // clips, avances, etc.
+    if (!id[0] || !title[0] || el_has(l, id)) continue;
+    Entry *e = el_add(l); if (!e) break;
+    snprintf(e->id, sizeof e->id, "%s", id);
+    snprintf(e->title, sizeof e->title, "%s", title);
+    if (kind == 2) snprintf(e->name, sizeof e->name, "[Serie] %s", title);
+    else snprintf(e->name, sizeof e->name, "%s", title);
+    e->kind = kind;
   }
 }
 
@@ -1919,9 +1942,9 @@ static int global_search(void) {
   snprintf(res_ls.query, sizeof res_ls.query, "%s", q);
   res_ls.sel = res_ls.top = 0;
   for (;;) {
-    int r = list_screen("Buscar en peliculas y series", all_items.names, all_items.n, &res_ls,
-                        cancelled ? "Busqueda parcial (se cancelo el recorrido)   X: ver / abrir   O: categorias"
-                                  : "X: ver / abrir serie   O: categorias   SELECT: en vivo");
+    int r = list_screen_ex("Buscar pelicula o serie", all_items.names, all_items.keys, all_items.n, &res_ls,
+                           cancelled ? "Busqueda parcial (se cancelo el recorrido)   X: ver / abrir   O: categorias"
+                                     : "X: ver / abrir serie   O: categorias   SELECT: en vivo", 0);
     if (r == LS_MODE || r == LS_EXIT) return r;
     if (r == LS_BACK) return 0;
     Entry it = all_items.e[r];          // copia: el indice no cambia mientras tanto, pero por si acaso
@@ -1935,7 +1958,7 @@ static int vod_browse(void) {
   static ListState cat_ls;
   if (load_categories() < 0) { show_error("No se pudo bajar el catalogo"); return LS_MODE; }
   for (;;) {
-    int ci = list_screen_ex("A la carta: categorias", vod_cats.names, vod_cats.n, &cat_ls,
+    int ci = list_screen_ex("A la carta: categorias", vod_cats.names, NULL, vod_cats.n, &cat_ls,
                             "X: abrir   TRIANGULO: buscar pelicula o serie   SELECT: en vivo", 1);
     if (ci == LS_MODE || ci == LS_EXIT) return ci;
     if (ci == LS_BACK) return LS_MODE;
@@ -1944,7 +1967,7 @@ static int vod_browse(void) {
     if (load_items(ci, &items, 0) < 0) { el_free(&items); show_error("Categoria vacia o sin acceso"); continue; }
     char title[160]; snprintf(title, sizeof title, "A la carta: %s", vod_cats.e[ci].name);
     for (;;) {
-      int ii = list_screen(title, items.names, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo");
+      int ii = list_screen_ex(title, items.names, items.keys, items.n, &item_ls, "X: ver / abrir serie   O: categorias   SELECT: en vivo", 0);
       if (ii == LS_MODE || ii == LS_EXIT) { el_free(&items); return ii; }
       if (ii == LS_BACK) break;
       Entry it = items.e[ii];
